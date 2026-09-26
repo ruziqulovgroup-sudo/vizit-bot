@@ -1466,5 +1466,7 @@ def run_forever():
 if __name__ == "__main__":
     import sys
 
-  if __name__ == "__main__":
-    telegram_polling()
+    if "--once" in sys.argv:
+        run_once()
+    else:
+        run_forever()
