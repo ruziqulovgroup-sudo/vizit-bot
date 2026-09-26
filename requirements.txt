@@ -1,4 +1,4 @@
-gspread
-google-auth
-requests
-python-dotenv
+gspread==6.1.2
+google-auth==2.32.0
+requests==2.32.3
+python-dotenv==1.0.1
