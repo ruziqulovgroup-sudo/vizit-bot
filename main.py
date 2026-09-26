@@ -28,6 +28,7 @@ import time
 import logging
 from datetime import datetime
 from collections import defaultdict
+import html
 
 import json
 import gspread
@@ -47,7 +48,7 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 #      to'g'ridan-to'g'ri shu o'zgaruvchiga joylashtirasiz (fayl shart emas)
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON") or os.getenv("GOOGLE_CREDENTIALS")
-VIZITLAR_SHEET_NAME = os.getenv("VIZITLAR_SHEET_NAME", "Vizitlar")
+VIZITLAR_SHEET_NAME = os.getenv("VIZITLAR_SHEET_NAME", "Визитлар")
 
 # Railway compatibility:
 # If credentials are supplied through an environment variable, also create
@@ -67,6 +68,11 @@ else:
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID")
 
+# Gemini AI (ixtiyoriy, savollarga tabiiy tilda javob berish uchun)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "30"))
+
 # Погрешность shu metrdan katta bo'lsa - xato
 MAX_POGRESHNOST_METERS = float(os.getenv("MAX_POGRESHNOST_METERS", 150))
 
@@ -76,6 +82,10 @@ CHECK_ZERO_PHOTO = os.getenv("CHECK_ZERO_PHOTO", "true").lower() == "true"
 # Bitta do'kondan keyingisiga o'tish uchun kamida shuncha daqiqa kerak
 # (undan kam bo'lsa - "juda tez, real emas" deb hisoblanadi)
 MIN_TRAVEL_MINUTES = float(os.getenv("MIN_TRAVEL_MINUTES", 3))
+
+# Agentning bir magazindan chiqib, keyingi magazinga yetib borishida
+# shuncha daqiqadan KO'P vaqt bo'sh qolsa, vaqt yo'qotilishi sifatida ko'rsatiladi.
+MAX_IDLE_GAP_MINUTES = float(os.getenv("MAX_IDLE_GAP_MINUTES", 15))
 
 # Sana/vaqt formati (tizimingizdagi format: "26.09.2026 12:14:18")
 DATETIME_FORMAT = os.getenv("DATETIME_FORMAT", "%d.%m.%Y %H:%M:%S")
@@ -174,8 +184,30 @@ def get_sheet_client():
 
 
 def load_vizitlar(client):
-    sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(VIZITLAR_SHEET_NAME)
-    return sheet.get_all_records()
+    """Vizitlar varag'ini topadi. Railway variable orqali nom berish mumkin.
+    Agar nom berilmagan bo'lsa, o'zbek/ruscha variantlarni navbat bilan tekshiradi.
+    """
+    spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+    candidates = [
+        VIZITLAR_SHEET_NAME,
+        "Визитлар",
+        "Vizitlar",
+        "Визиты",
+        "Визит",
+    ]
+    seen = set()
+    for title in candidates:
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        try:
+            return spreadsheet.worksheet(title).get_all_records()
+        except gspread.exceptions.WorksheetNotFound:
+            continue
+    mavjud = [ws.title for ws in spreadsheet.worksheets()]
+    raise RuntimeError(
+        "Vizitlar varag'i topilmadi. Mavjud varaqlar: " + ", ".join(mavjud)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +268,10 @@ def check_visits():
         if CHECK_ZERO_PHOTO and r["foto_soni"] == 0:
             muammolar[r["id"]].append("Rasm biriktirilmagan (Фото: 0)")
 
-    # --- YANGI: do'kondan-do'konga o'tish vaqtini tekshirish ---
+    # --- DO'KONDAN-DO'KONGA O'TISH VAQTINI TEKSHIRISH ---
+    # Har bir agentning ketma-ket vizitlari orasidagi bo'sh vaqtni hisoblaymiz:
+    # oldingi magazin tugagan vaqt -> keyingi magazin boshlangan vaqt.
+    # Bir kun ichidagi vizitlarni solishtiramiz, tun bo'yicha katta gapni hisoblamaymiz.
     by_agent = defaultdict(list)
     for r in rows:
         if r["start_dt"] is not None:
@@ -247,7 +282,22 @@ def check_visits():
         for prev, curr in zip(agent_rows, agent_rows[1:]):
             if prev["end_dt"] is None or curr["start_dt"] is None:
                 continue
+
+            # Turli kunlarni solishtirmaymiz.
+            if prev["end_dt"].date() != curr["start_dt"].date():
+                continue
+
             gap_minutes = (curr["start_dt"] - prev["end_dt"]).total_seconds() / 60.0
+            gap_seconds = max(0, int(round(gap_minutes * 60)))
+            gap_h = gap_seconds // 3600
+            gap_m = (gap_seconds % 3600) // 60
+            gap_s = gap_seconds % 60
+            if gap_h:
+                gap_text = f"{gap_h} soat {gap_m} daqiqa {gap_s} soniya"
+            elif gap_m:
+                gap_text = f"{gap_m} daqiqa {gap_s} soniya"
+            else:
+                gap_text = f"{gap_s} soniya"
 
             if gap_minutes < 0:
                 muammolar[curr["id"]].append(
@@ -257,7 +307,14 @@ def check_visits():
             elif gap_minutes < MIN_TRAVEL_MINUTES:
                 muammolar[curr["id"]].append(
                     f"O'tish vaqti juda qisqa: '{prev['mijoz']}' dan '{curr['mijoz']}'gacha "
-                    f"atigi {gap_minutes:.1f} daqiqa (chegara: {MIN_TRAVEL_MINUTES:.0f} daqiqa)"
+                    f"atigi {gap_text} (chegara: {MIN_TRAVEL_MINUTES:.0f} daqiqa)"
+                )
+            elif gap_minutes >= MAX_IDLE_GAP_MINUTES:
+                # Vaqt yo'qotilishi alohida muammo sifatida qayd qilinadi.
+                muammolar[curr["id"]].append(
+                    f"Vaqt yo'qotilishi: '{prev['mijoz']}' viziti {prev['end_dt'].strftime('%H:%M:%S')} da tugagan, "
+                    f"'{curr['mijoz']}' viziti {curr['start_dt'].strftime('%H:%M:%S')} da boshlangan — "
+                    f"oradagi bo'sh vaqt {gap_text} (chegara: {MAX_IDLE_GAP_MINUTES:.0f} daqiqa)"
                 )
 
     # Natijani ro'yxat shakliga o'tkazish
@@ -280,30 +337,41 @@ def check_visits():
 # HISOBOT TUZISH VA YUBORISH
 # ---------------------------------------------------------------------------
 def build_report(xatolar):
-    hozir = datetime.now().strftime("%Y-%m-%d %H:%M")
+    hozir = datetime.now().strftime("%d.%m.%Y %H:%M")
 
     if not xatolar:
-        return f"✅ <b>Vizit tekshiruvi</b> ({hozir})\nHech qanday xato topilmadi."
+        return (
+            f"✅ <b>VIZIT TEKSHIRUVI</b>\n"
+            f"🕐 {hozir}\n\n"
+            "🎉 <b>Muammoli vizitlar topilmadi.</b>"
+        )
 
     agent_guruh = defaultdict(list)
     for x in xatolar:
         agent_guruh[x["agent"] or "Noma'lum"].append(x)
 
-    lines = [f"📋 <b>Vizit tekshiruvi hisoboti</b> ({hozir})",
-             f"Jami {len(xatolar)} ta muammoli vizit topildi:\n"]
+    lines = [
+        "🚨 <b>VIZIT TEKSHIRUVI</b>",
+        f"🕐 {hozir}",
+        f"🔴 <b>Muammoli vizitlar: {len(xatolar)} ta</b>",
+        f"⏱ <b>Vaqt yo'qotish chegarasi:</b> {MAX_IDLE_GAP_MINUTES:.0f} daqiqa",
+        "",
+    ]
 
-    for agent, items in agent_guruh.items():
-        lines.append(f"👤 <b>{agent}</b> — {len(items)} ta muammo")
-        for x in items:
-            sabab_matn = "\n     ⚠️ ".join(x["sabablar"])
+    for agent, items in sorted(agent_guruh.items()):
+        lines.append(f"👤 <b>{html.escape(agent)}</b> — {len(items)} ta")
+        for i, x in enumerate(items, 1):
+            sabablar = "\n".join(f"      ⚠️ {html.escape(str(s))}" for s in x["sabablar"])
             lines.append(
-                f"   • ИД {x['id']} | {x['vaqt']} | Мижоз: {x['mijoz']}\n"
-                f"     ⚠️ {sabab_matn}"
+                f"  <b>{i}.</b> 🏪 {html.escape(str(x['mijoz']))}\n"
+                f"      🆔 {html.escape(str(x['id']))}\n"
+                f"      🕐 {html.escape(str(x['vaqt']))}\n"
+                f"      {sabablar}"
             )
         lines.append("")
 
+    lines.append("💡 <i>Vaqt yo'qotilishi — oldingi magazin tugagan va keyingi magazin boshlangan vaqt orasidagi bo'sh vaqt.</i>")
     return "\n".join(lines)
-
 
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -317,6 +385,209 @@ def send_telegram_message(text: str):
         })
         if resp.status_code != 200:
             log.error(f"Telegramga yuborishda xato: {resp.text}")
+
+
+# ---------------------------------------------------------------------------
+# AI SAVOL-JAVOB
+# ---------------------------------------------------------------------------
+def normalize_name(text):
+    text = str(text or "").lower().replace("ё", "е")
+    return re.sub(r"[^a-zа-яё0-9]+", " ", text).strip()
+
+
+def resolve_agent_for_user(message, rows):
+    """Telegram profilidan agentni ehtiyotkorlik bilan aniqlash."""
+    chat = message.get("chat") or {}
+    first = normalize_name(chat.get("first_name", ""))
+    last = normalize_name(chat.get("last_name", ""))
+    username = normalize_name(chat.get("username", ""))
+    profile = " ".join(x for x in [first, last, username] if x)
+    if not profile:
+        return None
+
+    agents = sorted({r.get("agent", "").strip() for r in rows if r.get("agent", "").strip()})
+    exact = []
+    for agent in agents:
+        a = normalize_name(agent)
+        if a and (a == profile or a in profile or profile in a):
+            exact.append(agent)
+    if len(exact) == 1:
+        return exact[0]
+
+    profile_tokens = set(profile.split())
+    scored = []
+    for agent in agents:
+        tokens = set(normalize_name(agent).split())
+        common = len(profile_tokens & tokens)
+        if common:
+            scored.append((common, agent))
+    if scored:
+        scored.sort(reverse=True)
+        best = scored[0]
+        if len(scored) == 1 or best[0] > scored[1][0]:
+            return best[1]
+    return None
+
+
+def compact_rows_for_ai(rows, agent_name=None, max_rows=700):
+    if agent_name:
+        filtered = [r for r in rows if r.get("agent") == agent_name]
+    else:
+        filtered = list(rows)
+
+    # Eng yangi yozuvlarni oldinga qo'yamiz.
+    filtered.sort(key=lambda r: r.get("start_dt") or datetime.min, reverse=True)
+    filtered = filtered[:max_rows]
+
+    # AI uchun ketma-ket vizitlar orasidagi vaqtni Python oldindan hisoblab beradi.
+    # Shunda Gemini vaqtni taxmin qilmaydi, tayyor aniq qiymatni tushuntiradi.
+    by_agent = defaultdict(list)
+    for r in filtered:
+        if r.get("start_dt") is not None:
+            by_agent[r.get("agent", "")].append(r)
+
+    idle_by_id = {}
+    for agent, agent_rows in by_agent.items():
+        agent_rows.sort(key=lambda x: x.get("start_dt") or datetime.min)
+        for prev, curr in zip(agent_rows, agent_rows[1:]):
+            if not prev.get("end_dt") or not curr.get("start_dt"):
+                continue
+            if prev["end_dt"].date() != curr["start_dt"].date():
+                continue
+            gap_seconds = int((curr["start_dt"] - prev["end_dt"]).total_seconds())
+            if gap_seconds >= 0:
+                idle_by_id[curr.get("id", "")] = {
+                    "previous_client": prev.get("mijoz", ""),
+                    "previous_end": prev["end_dt"].strftime(DATETIME_FORMAT),
+                    "next_client": curr.get("mijoz", ""),
+                    "next_start": curr["start_dt"].strftime(DATETIME_FORMAT),
+                    "gap_minutes": round(gap_seconds / 60, 2),
+                    "is_idle_problem": gap_seconds / 60 >= MAX_IDLE_GAP_MINUTES,
+                    "is_too_short": gap_seconds / 60 < MIN_TRAVEL_MINUTES,
+                }
+
+    result = []
+    for r in filtered:
+        result.append({
+            "id": r.get("id", ""),
+            "agent": r.get("agent", ""),
+            "client": r.get("mijoz", ""),
+            "zone": r.get("zona", ""),
+            "visit_time": r.get("vaqt_raw", ""),
+            "start": r.get("start_dt").strftime(DATETIME_FORMAT) if r.get("start_dt") else "",
+            "end": r.get("end_dt").strftime(DATETIME_FORMAT) if r.get("end_dt") else "",
+            "gps_m": r.get("pogreshnost_m", 0),
+            "gps_raw": str(r.get("pogreshnost_raw", "")),
+            "photos": r.get("foto_soni", 0),
+            "previous_visit_gap": idle_by_id.get(r.get("id", ""), {}),
+        })
+    return result
+
+
+def ask_gemini(question, rows, agent_name=None):
+    if not GEMINI_API_KEY:
+        return (
+            "⚠️ AI savol-javob hali yoqilmagan. Railway Variables'da "
+            "GEMINI_API_KEY variable qo'shing."
+        )
+
+    data = compact_rows_for_ai(rows, agent_name=agent_name)
+    today = datetime.now().strftime("%d.%m.%Y")
+    scope = (
+        f"Foydalanuvchi agent: {agent_name}. Faqat shu agent ma'lumotlari haqida javob ber."
+        if agent_name
+        else "Foydalanuvchi menejer. Barcha agentlar ma'lumotidan foydalanish mumkin."
+    )
+
+    system = f"""
+Sen Telegramdagi Vizitlar analitika yordamchisisan.
+Bugungi sana: {today}.
+{scope}
+
+Qoidalar:
+1. Javobni faqat berilgan Google Sheets ma'lumotlariga tayab ber.
+2. Savol oldindan kodga yozilmagan bo'lsa ham, ma'nosini tushunib javob ber.
+3. 'bugun', 'kecha', 'shu oy', 'eng ko'p', 'nechta', 'qaysi klient' kabi savollarni ma'lumotdan hisobla.
+4. Sonlarni aniq hisobla. Hisoblash imkoni bo'lmasa, buni ochiq ayt.
+5. Ma'lumotda yo'q narsani o'ylab topma.
+6. Telegram uchun qisqa, tushunarli o'zbek tilida yoz. Kerak bo'lsa ruscha mijoz/agent nomlarini aynan saqla.
+7. Hisobot bo'lsa emoji va punktlardan foydalan. Juda uzun jadval chiqarmagin.
+8. 'GPS xatosi' uchun gps_m, foto uchun photos ustunidan foydalan.
+9. 'muammoli vizit' deganda GPS > MAX_POGRESHNOST_METERS yoki photos=0 yoki tekshiruvdagi vaqt muammolarini hisobga ol.
+10. Agar foydalanuvchi "vaqt yo'qotilishi", "orasida qancha vaqt", "qaysi magazinlar orasida vaqt ketgan" deb so'rasa, har bir agentning ketma-ket vizitlarini tartib bilan ko'rib chiq: oldingi vizitning Konец визита va keyingi vizitning Начала визита orasini hisobla. MAX_IDLE_GAP_MINUTES dan katta bo'lsa muammo sifatida ko'rsat. Javobda oldingi magazin, tugagan vaqt, keyingi magazin, boshlangan vaqt va yo'qotilgan vaqtni ko'rsat.
+11. Agar "ID bo'yicha" deyilsa, vizitning ИД maydonini ham javobga qo'sh.
+12. Javob oxirida qisqa xulosa ber.
+
+Tekshiruv chegaralari:
+- GPS: {MAX_POGRESHNOST_METERS} metr
+- Foto 0: {'ha' if CHECK_ZERO_PHOTO else 'yo\'q'}
+- Minimal o'tish vaqti: {MIN_TRAVEL_MINUTES} daqiqa
+- Vaqt yo'qotilishi chegarasi: {MAX_IDLE_GAP_MINUTES} daqiqa
+
+Google Sheets ma'lumotlari JSON:
+{json.dumps(data, ensure_ascii=False, default=str)}
+"""
+
+    # Gemini API REST: rasmiy generateContent endpoint.
+    # API key faqat Railway Environment Variable orqali olinadi.
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    payload = {
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": question}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 1600,
+        },
+    }
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "x-goog-api-key": GEMINI_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=GEMINI_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            log.error(f"Gemini API xatosi: {resp.text[:1000]}")
+            return f"⚠️ AI javobida xato: {resp.status_code}. Railway logini tekshiring."
+        body = resp.json()
+        candidates = body.get("candidates", [])
+        if not candidates:
+            return "⚠️ AI javob qaytarmadi. Savolni boshqacha yozib ko'ring."
+        parts = candidates[0].get("content", {}).get("parts", [])
+        answer = "\n".join(p.get("text", "") for p in parts if p.get("text"))
+        return answer.strip() or "⚠️ AI bo'sh javob qaytardi."
+    except requests.RequestException as e:
+        log.exception("Gemini API tarmoq xatosi")
+        return f"⚠️ AI bilan ulanishda xato: {e}"
+    except Exception as e:
+        log.exception("AI savol-javob xatosi")
+        return f"⚠️ AI javobini tayyorlashda xato: {e}"
+
+
+def answer_user_question(message, text):
+    """Oddiy savolni Google Sheets + Gemini orqali javobga aylantiradi."""
+    try:
+        client = get_sheet_client()
+        rows = load_and_parse_rows(client)
+    except Exception as e:
+        log.exception("Savol uchun Sheets o'qishda xato")
+        return f"🚨 Ma'lumotlarni o'qib bo'lmadi: {e}"
+
+    chat_id = (message.get("chat") or {}).get("id")
+    is_manager = bool(MANAGER_CHAT_ID and str(chat_id) == str(MANAGER_CHAT_ID))
+    agent_name = None if is_manager else resolve_agent_for_user(message, rows)
+
+    if not is_manager and not agent_name:
+        return (
+            "⚠️ Telegram profilingizni agent bilan bog'lay olmadim.\n\n"
+            "Iltimos, menejerga Telegram profilingizdagi ism/familiyangizni "
+            "agent nomi bilan moslab berishni ayting."
+        )
+
+    return ask_gemini(text, rows, agent_name=agent_name)
 
 
 # ---------------------------------------------------------------------------
@@ -429,11 +700,19 @@ def telegram_polling():
                         reply = "⛔ Bu buyruq faqat menejer uchun."
 
                 else:
-                    reply = (
-                        "🤖 Xabaringizni oldim.\n"
-                        "Vizitlarni tekshirish uchun /check, "
-                        "holatni ko'rish uchun /status yuboring."
-                    )
+                    # Endi kiritilmagan savollar ham AI orqali tahlil qilinadi.
+                    reply = "⏳ Savolingizni tahlil qilyapman..."
+                    try:
+                        # Avval foydalanuvchiga kutish holatini yuboramiz.
+                        requests.post(
+                            f"{api_url}/sendChatAction",
+                            data={"chat_id": chat_id, "action": "typing"},
+                            timeout=5,
+                        )
+                        reply = answer_user_question(message, text)
+                    except Exception as e:
+                        log.exception("Savolga javob berishda xato")
+                        reply = f"🚨 Savolni qayta ishlashda xato: {e}"
 
                 requests.post(
                     f"{api_url}/sendMessage",
