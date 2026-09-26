@@ -1,264 +1,158 @@
 """
-VIZIT AI ANALYTICS BOT — Railway / Google Sheets / Telegram / Gemini
-====================================================================
-
-Google Sheets ustunlari:
+VIZIT TEKSHIRUV BOTI (v3)
+==========================
+Sizning tizimingizdagi "Визиты" jadvali quyidagi ustunlarga ega:
     Время визита | ИД | Рабочая зона | Пользователь | Начала визита |
     Конец визита | Погрешность | Клиент | Фото
 
-Asosiy imkoniyatlar:
-    - Google Sheets'dan vizitlarni o'qish
-    - GPS, foto va vaqt oralig'i muammolarini aniqlash
-    - Agentlar bo'yicha dashboard
-    - Oldingi magazin tugashi -> keyingi magazin boshlanishi orasidagi
-      vaqtni hisoblash
-    - 15/30/60 daqiqadan ko'p vaqt yo'qotilgan holatlarni topish
-    - Telegram'da erkin savollarga Gemini orqali javob
-    - Savolni oldindan kodga yozish shart emas
-    - Agent va menejer uchun turli ma'lumot doirasi
-    - Google Sheets cache: har bir savolda qayta-qayta Sheets'ga urilmaydi
-    - Telegram 409 Conflict holatini nazoratli qayta ulash
-    - Railway environment variables bilan ishlaydi
+Bu ma'lumotni Google Sheets'ga joylaysiz, bot esa har bir vizitni tekshiradi:
+
+    1) Погрешность (GPS xatosi) MAX_POGRESHNOST_METERS dan katta bo'lsa -> XATO
+    2) Фото soni 0 bo'lsa (rasm biriktirilmagan) -> XATO (agar yoqilgan bo'lsa)
+    3) YANGI: Bitta do'kondan keyingi do'konga o'tish vaqti juda qisqa bo'lsa
+       (MIN_TRAVEL_MINUTES dan kam) -> XATO — fizik jihatdan bunday tez
+       borib bo'lmaydi, demak vizit soxta yoki oldindan bosilgan bo'lishi mumkin
+
+Har bir xato uchun: qaysi agent (Пользователь), qaysi mijoz (Клиент),
+qachon (Время визита), qancha metr/daqiqa xato ekani - Telegram orqali
+menejerga hisobot qilib yuboriladi.
 
 ISHGA TUSHIRISH:
-    python main.py
-    python main.py --once
-
-KERAKLI ENV:
-    GOOGLE_SHEET_ID
-    GOOGLE_CREDENTIALS_JSON
-    TELEGRAM_BOT_TOKEN
-    MANAGER_CHAT_ID
-    GEMINI_API_KEY
-
-Ixtiyoriy ENV:
-    GEMINI_MODEL=gemini-3.8-flash
-    VIZITLAR_SHEET_NAME=Vizitlar
-    MAX_POGRESHNOST_METERS=150
-    CHECK_ZERO_PHOTO=true
-    MIN_TRAVEL_MINUTES=3
-    MAX_IDLE_GAP_MINUTES=15
-    CHECK_INTERVAL_SECONDS=1800
-    DATA_CACHE_SECONDS=60
-    MAX_AI_ROWS=250
+    python main.py --once      # bir martalik tekshirish (sinov uchun)
+    python main.py             # doimiy rejim (har CHECK_INTERVAL_SECONDS'da)
 """
 
 import os
 import re
-import sys
 import time
-import json
-import html
 import logging
-import threading
-from datetime import datetime, timedelta
-from collections import defaultdict, Counter
+from datetime import datetime
+from collections import defaultdict
+import html
 
-import requests
+import json
 import gspread
 from google.oauth2.service_account import Credentials
+import requests
 from dotenv import load_dotenv
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
+# ---------------------------------------------------------------------------
+# SOZLAMALAR (.env fayldan o'qiladi)
+# ---------------------------------------------------------------------------
 load_dotenv()
 
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+# Ikki xil usulda berish mumkin:
+#   1) GOOGLE_CREDENTIALS_FILE - kompyuterda/serverda faylga yo'l (masalan credentials.json)
+#   2) GOOGLE_CREDENTIALS_JSON - Railway kabi joylarda, faylning ICHIDAGI matnni
+#      to'g'ridan-to'g'ri shu o'zgaruvchiga joylashtirasiz (fayl shart emas)
+GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON") or os.getenv("GOOGLE_CREDENTIALS")
+VIZITLAR_SHEET_NAME = os.getenv("VIZITLAR_SHEET_NAME", "Визитлар")
 
-GOOGLE_CREDENTIALS_JSON = (
-    os.getenv("GOOGLE_CREDENTIALS_JSON")
-    or os.getenv("GOOGLE_CREDENTIALS")
-    or ""
-).strip()
+# Railway compatibility:
+# If credentials are supplied through an environment variable, also create
+# credentials.json at runtime. This keeps both env-based and file-based
+# credential code compatible.
+if GOOGLE_CREDENTIALS_JSON and not os.path.exists(GOOGLE_CREDENTIALS_FILE):
+    try:
+        _credentials_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+        with open(GOOGLE_CREDENTIALS_FILE, "w", encoding="utf-8") as _f:
+            json.dump(_credentials_info, _f)
+        log_message = "Google credentials: Railway variable loaded."
+    except Exception as _e:
+        log_message = f"Google credentials variable invalid: {_e}"
+else:
+    log_message = "Google credentials: file mode."
 
-GOOGLE_CREDENTIALS_FILE = os.getenv(
-    "GOOGLE_CREDENTIALS_FILE", "credentials.json"
-).strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID", "").strip()
+# Gemini AI (ixtiyoriy, savollarga tabiiy tilda javob berish uchun)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "30"))
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
-GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "35"))
+# Погрешность shu metrdan katta bo'lsa - xato
+MAX_POGRESHNOST_METERS = float(os.getenv("MAX_POGRESHNOST_METERS", 150))
 
-VIZITLAR_SHEET_NAME = os.getenv(
-    "VIZITLAR_SHEET_NAME", "Vizitlar"
-).strip()
+# Фото soni 0 bo'lsa ham xato deb hisoblansinmi? (true/false)
+CHECK_ZERO_PHOTO = os.getenv("CHECK_ZERO_PHOTO", "true").lower() == "true"
 
-MAX_POGRESHNOST_METERS = float(
-    os.getenv("MAX_POGRESHNOST_METERS", "150")
-)
+# Bitta do'kondan keyingisiga o'tish uchun kamida shuncha daqiqa kerak
+# (undan kam bo'lsa - "juda tez, real emas" deb hisoblanadi)
+MIN_TRAVEL_MINUTES = float(os.getenv("MIN_TRAVEL_MINUTES", 3))
 
-CHECK_ZERO_PHOTO = (
-    os.getenv("CHECK_ZERO_PHOTO", "true").lower() == "true"
-)
+# Agentning bir magazindan chiqib, keyingi magazinga yetib borishida
+# shuncha daqiqadan KO'P vaqt bo'sh qolsa, vaqt yo'qotilishi sifatida ko'rsatiladi.
+MAX_IDLE_GAP_MINUTES = float(os.getenv("MAX_IDLE_GAP_MINUTES", 15))
 
-MIN_TRAVEL_MINUTES = float(
-    os.getenv("MIN_TRAVEL_MINUTES", "3")
-)
+# Sana/vaqt formati (tizimingizdagi format: "26.09.2026 12:14:18")
+DATETIME_FORMAT = os.getenv("DATETIME_FORMAT", "%d.%m.%Y %H:%M:%S")
 
-MAX_IDLE_GAP_MINUTES = float(
-    os.getenv("MAX_IDLE_GAP_MINUTES", "15")
-)
-
-CHECK_INTERVAL_SECONDS = int(
-    os.getenv("CHECK_INTERVAL_SECONDS", "1800")
-)
-
-DATA_CACHE_SECONDS = int(
-    os.getenv("DATA_CACHE_SECONDS", "60")
-)
-
-MAX_AI_ROWS = int(
-    os.getenv("MAX_AI_ROWS", "250")
-)
-
-DATETIME_FORMAT = os.getenv(
-    "DATETIME_FORMAT", "%d.%m.%Y %H:%M:%S"
-)
-
-# 0 = no limit
-MAX_REPORT_ITEMS = int(os.getenv("MAX_REPORT_ITEMS", "80"))
-
-# ============================================================
-# LOGGING
-# ============================================================
+# Doimiy rejimda necha soniyada bir marta tekshirish
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", 1800))
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("visit-bot")
+log = logging.getLogger(__name__)
+log.info(log_message)
+
+if not GOOGLE_CREDENTIALS_JSON and not os.path.exists(GOOGLE_CREDENTIALS_FILE):
+    log.error(
+        "Google credentials topilmadi. Railway Variables'da "
+        "GOOGLE_CREDENTIALS yoki GOOGLE_CREDENTIALS_JSON bo'lishi kerak."
+    )
 
 
-# ============================================================
-# GLOBAL CACHE / LOCKS
-# ============================================================
-
-_DATA_LOCK = threading.Lock()
-_DATA_CACHE = {
-    "rows": None,
-    "loaded_at": 0.0,
-    "sheet_title": None,
-}
-
-_CHECK_LOCK = threading.Lock()
-_TELEGRAM_LOCK = threading.Lock()
-
-
-# ============================================================
-# BASIC HELPERS
-# ============================================================
-
-def esc(value) -> str:
-    return html.escape(str(value or ""), quote=False)
-
-
-def normalize_text(value) -> str:
-    value = str(value or "").lower().replace("ё", "е")
-    return re.sub(r"\s+", " ", value).strip()
-
-
-def normalize_name(value) -> str:
-    value = normalize_text(value)
-    return re.sub(r"[^a-zа-яё0-9]+", " ", value).strip()
-
-
-def safe_float(value, default=0.0):
-    try:
-        return float(str(value).replace(",", ".").strip())
-    except Exception:
-        return default
-
-
-def safe_int(value, default=0):
-    try:
-        return int(float(str(value).replace(",", ".").strip()))
-    except Exception:
-        return default
-
-
-def format_minutes(minutes: float) -> str:
-    if minutes is None:
-        return "—"
-
-    seconds = max(0, int(round(minutes * 60)))
-    hours, rem = divmod(seconds, 3600)
-    mins, secs = divmod(rem, 60)
-
-    if hours:
-        return f"{hours} soat {mins} daqiqa"
-    if mins:
-        return f"{mins} daqiqa {secs} soniya"
-    return f"{secs} soniya"
-
-
-def parse_datetime(value):
-    if not value:
-        return None
-
-    text = str(value).strip()
-
-    formats = [
-        DATETIME_FORMAT,
-        "%d.%m.%Y %H:%M:%S",
-        "%d.%m.%Y %H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-    ]
-
-    for fmt in formats:
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            pass
-
-    # ISO fallback
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(
-            tzinfo=None
-        )
-    except Exception:
-        return None
-
-
-def parse_pogreshnost(value) -> float:
+# ---------------------------------------------------------------------------
+# YORDAMCHI FUNKSIYALAR
+# ---------------------------------------------------------------------------
+def parse_pogreshnost(text) -> float:
     """
-    280 м. -> 280
-    1 км. 914 м. -> 1914
+    '280 м.'        -> 280
+    '3 м.'          -> 3
+    '1 км. 914 м.'  -> 1914
     """
-    text = str(value or "").strip().lower()
-
+    if text is None:
+        return 0.0
+    text = str(text).strip().lower()
     if not text:
         return 0.0
 
-    km = re.search(r"(\d+(?:[.,]\d+)?)\s*км", text)
-    meters = re.search(r"(\d+(?:[.,]\d+)?)\s*м(?!\w)", text)
+    km_match = re.search(r"(\d+(?:[.,]\d+)?)\s*км", text)
+    m_match = re.search(r"(\d+(?:[.,]\d+)?)\s*м(?!\w)", text)
 
-    result = 0.0
+    total_meters = 0.0
+    if km_match:
+        total_meters += float(km_match.group(1).replace(",", ".")) * 1000
+    if m_match:
+        total_meters += float(m_match.group(1).replace(",", "."))
 
-    if km:
-        result += safe_float(km.group(1)) * 1000
+    if not km_match and not m_match:
+        num_match = re.search(r"(\d+(?:[.,]\d+)?)", text)
+        if num_match:
+            total_meters = float(num_match.group(1).replace(",", "."))
 
-    if meters:
-        result += safe_float(meters.group(1))
-
-    if result == 0:
-        number = re.search(r"(\d+(?:[.,]\d+)?)", text)
-        if number:
-            result = safe_float(number.group(1))
-
-    return result
+    return total_meters
 
 
-# ============================================================
-# GOOGLE SHEETS
-# ============================================================
+def parse_datetime(text):
+    """'26.09.2026 12:14:18' -> datetime object. Xato bo'lsa None qaytaradi."""
+    if not text:
+        return None
+    text = str(text).strip()
+    try:
+        return datetime.strptime(text, DATETIME_FORMAT)
+    except ValueError:
+        return None
 
+
+# ---------------------------------------------------------------------------
+# GOOGLE SHEETS BILAN ULANISH
+# ---------------------------------------------------------------------------
 def get_sheet_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -270,1040 +164,383 @@ def get_sheet_client():
             info = json.loads(GOOGLE_CREDENTIALS_JSON)
         except json.JSONDecodeError as e:
             raise RuntimeError(
-                "GOOGLE_CREDENTIALS_JSON noto'g'ri JSON. "
+                "GOOGLE_CREDENTIALS JSON noto'g'ri formatda. "
                 f"JSON xatosi: {e}"
             ) from e
-
-        creds = Credentials.from_service_account_info(
-            info,
-            scopes=scopes,
-        )
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
     else:
         if not os.path.exists(GOOGLE_CREDENTIALS_FILE):
             raise RuntimeError(
-                "Google credentials topilmadi. Railway Variables'da "
-                "GOOGLE_CREDENTIALS_JSON ni to'liq JSON ko'rinishida "
-                "qo'ying."
+                "credentials.json topilmadi. Railway Variables'ga "
+                "GOOGLE_CREDENTIALS nomli variable qo'shing va unga "
+                "credentials.json ichidagi to'liq JSON matnini joylang."
             )
-
         creds = Credentials.from_service_account_file(
             GOOGLE_CREDENTIALS_FILE,
-            scopes=scopes,
+            scopes=scopes
         )
 
     return gspread.authorize(creds)
 
 
-def find_worksheet(spreadsheet):
+def load_vizitlar(client):
+    """Vizitlar varag'ini topadi. Railway variable orqali nom berish mumkin.
+    Agar nom berilmagan bo'lsa, o'zbek/ruscha variantlarni navbat bilan tekshiradi.
+    """
+    spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
     candidates = [
         VIZITLAR_SHEET_NAME,
-        "Vizitlar",
         "Визитлар",
+        "Vizitlar",
         "Визиты",
         "Визит",
     ]
-
     seen = set()
-
     for title in candidates:
         if not title or title in seen:
             continue
-
         seen.add(title)
-
         try:
-            ws = spreadsheet.worksheet(title)
-            return ws
+            return spreadsheet.worksheet(title).get_all_records()
         except gspread.exceptions.WorksheetNotFound:
             continue
-
-    available = [ws.title for ws in spreadsheet.worksheets()]
-
+    mavjud = [ws.title for ws in spreadsheet.worksheets()]
     raise RuntimeError(
-        "Vizitlar varag'i topilmadi. Mavjud varaqlar: "
-        + ", ".join(available)
+        "Vizitlar varag'i topilmadi. Mavjud varaqlar: " + ", ".join(mavjud)
     )
 
 
-def load_rows_from_sheets():
-    client = get_sheet_client()
-    spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
-    worksheet = find_worksheet(spreadsheet)
-
-    raw = worksheet.get_all_records()
-
+# ---------------------------------------------------------------------------
+# TEKSHIRISH MANTIG'I
+# ---------------------------------------------------------------------------
+def load_and_parse_rows(client):
+    """Barcha qatorlarni o'qiydi va kerakli maydonlarni ajratib beradi."""
+    raw_rows = load_vizitlar(client)
     parsed = []
-
-    for row in raw:
-        visit_id = str(row.get("ИД", "")).strip()
+    for row in raw_rows:
+        vizit_id = str(row.get("ИД", "")).strip()
         agent = str(row.get("Пользователь", "")).strip()
-        client_name = str(row.get("Клиент", "")).strip()
-        zone = str(row.get("Рабочая зона", "")).strip()
+        mijoz = str(row.get("Клиент", "")).strip()
+        zona = str(row.get("Рабочая зона", "")).strip()
+        pogreshnost_raw = row.get("Погрешность", "")
+        foto_raw = row.get("Фото", 0)
+
+        start_dt = parse_datetime(row.get("Начала визита"))
+        end_dt = parse_datetime(row.get("Конец визита"))
+        vaqt_raw = str(row.get("Время визита", "")).strip()
 
-        start = parse_datetime(row.get("Начала визита"))
-        end = parse_datetime(row.get("Конец визита"))
-
-        parsed.append(
-            {
-                "id": visit_id,
-                "agent": agent,
-                "client": client_name,
-                "zone": zone,
-                "visit_time_raw": str(
-                    row.get("Время визита", "")
-                ).strip(),
-                "start": start,
-                "end": end,
-                "gps_m": parse_pogreshnost(
-                    row.get("Погрешность", "")
-                ),
-                "gps_raw": str(
-                    row.get("Погрешность", "")
-                ).strip(),
-                "photos": safe_int(row.get("Фото", 0)),
-            }
-        )
-
-    calculate_visit_gaps(parsed)
-
-    log.info(
-        "Google Sheets: %s ta vizit yuklandi. Sheet=%s",
-        len(parsed),
-        worksheet.title,
-    )
-
-    return parsed, worksheet.title
-
-
-def get_rows(force=False):
-    now = time.time()
-
-    with _DATA_LOCK:
-        if (
-            not force
-            and _DATA_CACHE["rows"] is not None
-            and now - _DATA_CACHE["loaded_at"] < DATA_CACHE_SECONDS
-        ):
-            return _DATA_CACHE["rows"]
-
-        rows, sheet_title = load_rows_from_sheets()
-
-        _DATA_CACHE["rows"] = rows
-        _DATA_CACHE["loaded_at"] = now
-        _DATA_CACHE["sheet_title"] = sheet_title
-
-        return rows
-
-
-# ============================================================
-# VISIT ANALYTICS
-# ============================================================
-
-def calculate_visit_gaps(rows):
-    """
-    Har bir agent uchun:
-        oldingi vizit tugashi -> keyingi vizit boshlanishi
-
-    Natija curr['gap_minutes'] ichiga yoziladi.
-    """
-
-    by_agent = defaultdict(list)
-
-    for row in rows:
-        if row.get("start"):
-            by_agent[row["agent"]].append(row)
-
-    for agent_rows in by_agent.values():
-        agent_rows.sort(key=lambda x: x["start"])
-
-        previous = None
-
-        for current in agent_rows:
-            current["gap_minutes"] = None
-            current["previous_client"] = ""
-            current["previous_end"] = None
-            current["gap_problem"] = False
-            current["too_short"] = False
-
-            if (
-                previous
-                and previous.get("end")
-                and current.get("start")
-                and previous["end"].date() == current["start"].date()
-            ):
-                gap = (
-                    current["start"] - previous["end"]
-                ).total_seconds() / 60
-
-                current["gap_minutes"] = round(gap, 2)
-                current["previous_client"] = previous["client"]
-                current["previous_end"] = previous["end"]
-
-                if gap >= MAX_IDLE_GAP_MINUTES:
-                    current["gap_problem"] = True
-
-                if 0 <= gap < MIN_TRAVEL_MINUTES:
-                    current["too_short"] = True
-
-            previous = current
-
-
-def visit_has_problem(row):
-    reasons = []
-
-    if row["gps_m"] > MAX_POGRESHNOST_METERS:
-        reasons.append("GPS")
-
-    if CHECK_ZERO_PHOTO and row["photos"] == 0:
-        reasons.append("Foto")
-
-    if row.get("gap_problem"):
-        reasons.append("Vaqt")
-
-    if row.get("too_short"):
-        reasons.append("Juda qisqa o'tish")
-
-    if row.get("end") is None:
-        reasons.append("Tugamagan vizit")
-
-    return reasons
-
-
-def get_problem_visits(rows):
-    result = []
-
-    for row in rows:
-        reasons = visit_has_problem(row)
-
-        if reasons:
-            item = dict(row)
-            item["reasons"] = reasons
-            result.append(item)
-
-    return result
-
-
-def date_rows(rows, target_date):
-    return [
-        r for r in rows
-        if r.get("start") and r["start"].date() == target_date
-    ]
-
-
-def today_rows(rows):
-    return date_rows(rows, datetime.now().date())
-
-
-def yesterday_rows(rows):
-    return date_rows(
-        rows,
-        (datetime.now() - timedelta(days=1)).date(),
-    )
-
-
-def agent_names(rows):
-    return sorted(
-        {
-            r["agent"].strip()
-            for r in rows
-            if r.get("agent", "").strip()
-        }
-    )
-
-
-def resolve_agent_from_message(message, rows):
-    """
-    Agentni Telegram first_name/last_name/username orqali topishga
-    harakat qiladi.
-    """
-
-    chat = message.get("chat") or {}
-
-    profile_parts = [
-        chat.get("first_name", ""),
-        chat.get("last_name", ""),
-        chat.get("username", ""),
-    ]
-
-    profile = normalize_name(
-        " ".join(str(x) for x in profile_parts if x)
-    )
-
-    if not profile:
-        return None
-
-    agents = agent_names(rows)
-
-    # 1. exact
-    for agent in agents:
-        if normalize_name(agent) == profile:
-            return agent
-
-    # 2. substring
-    exactish = []
-
-    for agent in agents:
-        a = normalize_name(agent)
-
-        if a and (a in profile or profile in a):
-            exactish.append(agent)
-
-    if len(exactish) == 1:
-        return exactish[0]
-
-    # 3. token score
-    profile_tokens = set(profile.split())
-
-    scored = []
-
-    for agent in agents:
-        tokens = set(normalize_name(agent).split())
-        common = len(profile_tokens & tokens)
-
-        if common:
-            scored.append((common, agent))
-
-    if scored:
-        scored.sort(
-            key=lambda x: (x[0], len(x[1])),
-            reverse=True,
-        )
-
-        if len(scored) == 1:
-            return scored[0][1]
-
-        if scored[0][0] > scored[1][0]:
-            return scored[0][1]
-
-    return None
-
-
-# ============================================================
-# DASHBOARD DATA
-# ============================================================
-
-def agent_stats(rows, agent=None):
-    if agent:
-        rows = [
-            r for r in rows
-            if r["agent"] == agent
-        ]
-
-    total = len(rows)
-    photos_zero = sum(r["photos"] == 0 for r in rows)
-    gps_bad = sum(
-        r["gps_m"] > MAX_POGRESHNOST_METERS
-        for r in rows
-    )
-    gap_bad = sum(
-        bool(r.get("gap_problem"))
-        for r in rows
-    )
-    too_short = sum(
-        bool(r.get("too_short"))
-        for r in rows
-    )
-    unfinished = sum(
-        r.get("end") is None
-        for r in rows
-    )
-
-    gaps = [
-        r["gap_minutes"]
-        for r in rows
-        if r.get("gap_minutes") is not None
-        and r["gap_minutes"] >= 0
-    ]
-
-    total_lost = sum(
-        x for x in gaps
-        if x >= MAX_IDLE_GAP_MINUTES
-    )
-
-    max_gap = max(gaps, default=0)
-
-    return {
-        "total": total,
-        "photos_zero": photos_zero,
-        "gps_bad": gps_bad,
-        "gap_bad": gap_bad,
-        "too_short": too_short,
-        "unfinished": unfinished,
-        "total_lost_minutes": round(total_lost, 1),
-        "max_gap_minutes": round(max_gap, 1),
-    }
-
-
-def build_agent_ranking(rows):
-    result = []
-
-    for agent in agent_names(rows):
-        stats = agent_stats(rows, agent)
-        result.append(
-            {
-                "agent": agent,
-                **stats,
-            }
-        )
-
-    return sorted(
-        result,
-        key=lambda x: x["total"],
-        reverse=True,
-    )
-
-
-def build_gap_ranking(rows):
-    result = []
-
-    for row in rows:
-        if (
-            row.get("gap_minutes") is not None
-            and row["gap_minutes"] >= MAX_IDLE_GAP_MINUTES
-        ):
-            result.append(row)
-
-    return sorted(
-        result,
-        key=lambda x: x["gap_minutes"],
-        reverse=True,
-    )
-
-
-def find_by_id(rows, text):
-    ids = re.findall(r"\b\d{5,}\b", text)
-
-    if not ids:
-        return []
-
-    wanted = set(ids)
-
-    return [
-        r for r in rows
-        if r.get("id") in wanted
-    ]
-
-
-def find_by_client(rows, question):
-    q = normalize_text(question)
-
-    if len(q) < 4:
-        return []
-
-    candidates = []
-
-    for row in rows:
-        client = normalize_text(row.get("client", ""))
-
-        if client and client in q:
-            candidates.append(row)
-
-    return candidates
-
-
-def detect_date_filter(question):
-    q = normalize_text(question)
-    today = datetime.now().date()
-
-    if "bugun" in q or "бугун" in q:
-        return today
-
-    if "kecha" in q or "кеча" in q:
-        return today - timedelta(days=1)
-
-    m = re.search(
-        r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b",
-        q,
-    )
-
-    if m:
         try:
-            return datetime(
-                int(m.group(3)),
-                int(m.group(2)),
-                int(m.group(1)),
-            ).date()
-        except ValueError:
-            return None
+            foto_soni = int(foto_raw)
+        except (ValueError, TypeError):
+            foto_soni = 0
 
-    return None
-
-
-# ============================================================
-# TELEGRAM DASHBOARD
-# ============================================================
-
-def dashboard_header(title, subtitle=None):
-    lines = [
-        f"📊 <b>{esc(title)}</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
-
-    if subtitle:
-        lines.append(esc(subtitle))
-
-    lines.append("")
-
-    return lines
+        parsed.append({
+            "id": vizit_id,
+            "agent": agent,
+            "mijoz": mijoz,
+            "zona": zona,
+            "vaqt_raw": vaqt_raw,
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+            "pogreshnost_m": parse_pogreshnost(pogreshnost_raw),
+            "pogreshnost_raw": pogreshnost_raw,
+            "foto_soni": foto_soni,
+        })
+    return parsed
 
 
-def format_agent_dashboard(rows, agent=None):
-    if agent:
-        title = f"{agent} — vizit dashboard"
-        stats = agent_stats(rows, agent)
-    else:
-        title = "Umumiy vizit dashboard"
-        stats = agent_stats(rows)
+def check_visits():
+    client = get_sheet_client()
+    rows = load_and_parse_rows(client)
 
-    scoped = [
-        r for r in rows
-        if not agent or r["agent"] == agent
-    ]
+    # id -> muammolar ro'yxati (bir vizitda bir nechta muammo bo'lishi mumkin)
+    muammolar = defaultdict(list)
+    row_by_id = {}
 
-    today = date_rows(scoped, datetime.now().date())
+    for r in rows:
+        row_by_id[r["id"]] = r
 
-    today_stats = agent_stats(today)
-
-    lines = dashboard_header(
-        title,
-        f"📅 Bugun: {datetime.now():%d.%m.%Y}",
-    )
-
-    lines.extend(
-        [
-            f"👣 <b>Jami vizit:</b> {stats['total']:,}".replace(",", " "),
-            f"📅 <b>Bugungi vizit:</b> {today_stats['total']}",
-            "",
-            "🧩 <b>Muammolar</b>",
-            f"📸 Fotosiz: <b>{stats['photos_zero']}</b>",
-            f"📍 GPS xatosi: <b>{stats['gps_bad']}</b>",
-            f"⏱ Vaqt yo'qotish: <b>{stats['gap_bad']}</b>",
-            f"⚡ Juda qisqa o'tish: <b>{stats['too_short']}</b>",
-            f"🔴 Tugamagan vizit: <b>{stats['unfinished']}</b>",
-            "",
-            "⏱ <b>Vaqt</b>",
-            f"🔻 Jami yo'qotilgan vaqt: <b>{format_minutes(stats['total_lost_minutes'])}</b>",
-            f"🔴 Eng katta tanaffus: <b>{format_minutes(stats['max_gap_minutes'])}</b>",
-        ]
-    )
-
-    if agent:
-        problem_count = sum(
-            bool(visit_has_problem(r))
-            for r in scoped
-        )
-
-        lines.extend(
-            [
-                "",
-                f"🚨 <b>Muammoli vizitlar:</b> {problem_count}",
-            ]
-        )
-
-    return "\n".join(lines)
-
-
-def format_top_agents(rows, limit=10):
-    ranking = build_agent_ranking(rows)[:limit]
-
-    lines = dashboard_header(
-        "ENG KO'P VIZIT QILGAN AGENTLAR",
-        f"Top {len(ranking)}",
-    )
-
-    if not ranking:
-        return "\n".join(
-            lines + ["ℹ️ Ma'lumot topilmadi."]
-        )
-
-    medals = ["🥇", "🥈", "🥉"]
-
-    for i, item in enumerate(ranking, 1):
-        icon = medals[i - 1] if i <= 3 else f"{i}."
-
-        lines.append(
-            f"{icon} <b>{esc(item['agent'])}</b>\n"
-            f"   👣 {item['total']} vizit"
-        )
-
-    return "\n".join(lines)
-
-
-def format_top_problem_agents(rows, limit=10):
-    ranking = []
-
-    for agent in agent_names(rows):
-        subset = [
-            r for r in rows
-            if r["agent"] == agent
-        ]
-
-        problems = sum(
-            bool(visit_has_problem(r))
-            for r in subset
-        )
-
-        if problems:
-            ranking.append(
-                {
-                    "agent": agent,
-                    "problems": problems,
-                    "photos": sum(
-                        r["photos"] == 0 for r in subset
-                    ),
-                    "gps": sum(
-                        r["gps_m"] > MAX_POGRESHNOST_METERS
-                        for r in subset
-                    ),
-                    "gaps": sum(
-                        bool(r.get("gap_problem"))
-                        for r in subset
-                    ),
-                }
+        if r["pogreshnost_m"] > MAX_POGRESHNOST_METERS:
+            muammolar[r["id"]].append(
+                f"GPS xatosi katta: {r['pogreshnost_raw']} (chegara: {int(MAX_POGRESHNOST_METERS)} m)"
             )
 
-    ranking.sort(
-        key=lambda x: x["problems"],
-        reverse=True,
-    )
+        if CHECK_ZERO_PHOTO and r["foto_soni"] == 0:
+            muammolar[r["id"]].append("Rasm biriktirilmagan (Фото: 0)")
 
-    lines = dashboard_header(
-        "MUAMMOLI AGENTLAR",
-        f"Top {min(limit, len(ranking))}",
-    )
-
-    if not ranking:
-        lines.append("✅ Muammoli agent topilmadi.")
-        return "\n".join(lines)
-
-    for i, item in enumerate(ranking[:limit], 1):
-        lines.extend(
-            [
-                f"<b>{i}. {esc(item['agent'])}</b>",
-                f"   🔴 Jami muammo: <b>{item['problems']}</b>",
-                f"   📸 Fotosiz: {item['photos']}",
-                f"   📍 GPS: {item['gps']}",
-                f"   ⏱ Vaqt: {item['gaps']}",
-                "",
-            ]
-        )
-
-    return "\n".join(lines).rstrip()
-
-
-def format_photo_dashboard(rows, limit=10):
-    ranking = []
-
-    for agent in agent_names(rows):
-        subset = [
-            r for r in rows
-            if r["agent"] == agent
-        ]
-
-        count = sum(
-            r["photos"] == 0
-            for r in subset
-        )
-
-        if count:
-            ranking.append(
-                (
-                    agent,
-                    count,
-                    len(subset),
-                )
-            )
-
-    ranking.sort(
-        key=lambda x: x[1],
-        reverse=True,
-    )
-
-    total = sum(
-        r["photos"] == 0
-        for r in rows
-    )
-
-    lines = dashboard_header(
-        "FOTOSIZ VIZITLAR",
-        f"Jami: {total} ta",
-    )
-
-    if not ranking:
-        lines.append("✅ Fotosiz vizit topilmadi.")
-        return "\n".join(lines)
-
-    for i, (agent, count, total_agent) in enumerate(
-        ranking[:limit], 1
-    ):
-        percent = (
-            count / total_agent * 100
-            if total_agent else 0
-        )
-
-        lines.append(
-            f"<b>{i}. {esc(agent)}</b>\n"
-            f"   📸 Fotosiz: <b>{count}</b> / {total_agent} "
-            f"({percent:.1f}%)"
-        )
-
-    return "\n".join(lines)
-
-
-def format_gap_dashboard(rows, limit=10):
-    gaps = build_gap_ranking(rows)[:limit]
-
-    lines = dashboard_header(
-        "VAQT YO'QOTISHLARI",
-        f"Chegara: {MAX_IDLE_GAP_MINUTES:.0f} daqiqa",
-    )
-
-    if not gaps:
-        lines.append("✅ Katta vaqt yo'qotilishi topilmadi.")
-        return "\n".join(lines)
-
-    for i, row in enumerate(gaps, 1):
-        previous_end = (
-            row["previous_end"].strftime("%H:%M:%S")
-            if row.get("previous_end")
-            else "—"
-        )
-
-        start = (
-            row["start"].strftime("%H:%M:%S")
-            if row.get("start")
-            else "—"
-        )
-
-        lines.extend(
-            [
-                f"<b>{i}. {esc(row['agent'])}</b>",
-                f"🏪 {esc(row['previous_client'])}",
-                f"   ⏹ Tugadi: {previous_end}",
-                f"🏪 {esc(row['client'])}",
-                f"   ▶️ Boshlandi: {start}",
-                f"🔴 Yo'qotilgan vaqt: "
-                f"<b>{format_minutes(row['gap_minutes'])}</b>",
-                f"🆔 {esc(row['id'])}",
-                "",
-            ]
-        )
-
-    return "\n".join(lines).rstrip()
-
-
-def format_visit_details(rows, question):
-    matches = find_by_id(rows, question)
-
-    if not matches:
-        matches = find_by_client(rows, question)
-
-    if not matches:
-        return None
-
-    lines = dashboard_header(
-        "VIZIT TAFSILOTI",
-        f"Topildi: {len(matches)} ta",
-    )
-
-    for i, row in enumerate(matches[:10], 1):
-        reasons = visit_has_problem(row)
-
-        lines.extend(
-            [
-                f"<b>{i}. {esc(row['client'])}</b>",
-                f"👤 Agent: {esc(row['agent'])}",
-                f"🆔 ID: <code>{esc(row['id'])}</code>",
-                f"📅 {esc(row['visit_time_raw'])}",
-                f"▶️ Start: {row['start'].strftime('%d.%m.%Y %H:%M:%S') if row['start'] else '—'}",
-                f"⏹ End: {row['end'].strftime('%d.%m.%Y %H:%M:%S') if row['end'] else '—'}",
-                f"📍 GPS: {row['gps_m']:.0f} m",
-                f"📸 Foto: {row['photos']}",
-            ]
-        )
-
-        if row.get("gap_minutes") is not None:
-            lines.append(
-                f"⏱ Oldingi vizitdan tanaffus: "
-                f"{format_minutes(row['gap_minutes'])}"
-            )
-
-        if reasons:
-            lines.append(
-                "⚠️ Muammo: " +
-                ", ".join(esc(x) for x in reasons)
-            )
-        else:
-            lines.append("✅ Muammo aniqlanmadi.")
-
-        lines.append("")
-
-    return "\n".join(lines).rstrip()
-
-
-def format_check_report(rows):
-    problems = get_problem_visits(rows)
-
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
-
-    if not problems:
-        return (
-            "✅ <b>VIZIT TEKSHIRUVI</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 {now}\n\n"
-            "🎉 <b>Muammoli vizit topilmadi.</b>"
-        )
-
+    # --- DO'KONDAN-DO'KONGA O'TISH VAQTINI TEKSHIRISH ---
+    # Har bir agentning ketma-ket vizitlari orasidagi bo'sh vaqtni hisoblaymiz:
+    # oldingi magazin tugagan vaqt -> keyingi magazin boshlangan vaqt.
+    # Bir kun ichidagi vizitlarni solishtiramiz, tun bo'yicha katta gapni hisoblamaymiz.
     by_agent = defaultdict(list)
+    for r in rows:
+        if r["start_dt"] is not None:
+            by_agent[r["agent"]].append(r)
 
-    for item in problems:
-        by_agent[item["agent"] or "Noma'lum"].append(item)
+    for agent, agent_rows in by_agent.items():
+        agent_rows.sort(key=lambda r: r["start_dt"])
+        for prev, curr in zip(agent_rows, agent_rows[1:]):
+            if prev["end_dt"] is None or curr["start_dt"] is None:
+                continue
+
+            # Turli kunlarni solishtirmaymiz.
+            if prev["end_dt"].date() != curr["start_dt"].date():
+                continue
+
+            gap_minutes = (curr["start_dt"] - prev["end_dt"]).total_seconds() / 60.0
+            gap_seconds = max(0, int(round(gap_minutes * 60)))
+            gap_h = gap_seconds // 3600
+            gap_m = (gap_seconds % 3600) // 60
+            gap_s = gap_seconds % 60
+            if gap_h:
+                gap_text = f"{gap_h} soat {gap_m} daqiqa {gap_s} soniya"
+            elif gap_m:
+                gap_text = f"{gap_m} daqiqa {gap_s} soniya"
+            else:
+                gap_text = f"{gap_s} soniya"
+
+            if gap_minutes < 0:
+                muammolar[curr["id"]].append(
+                    f"Vaqt ziddiyati: '{curr['mijoz']}' vizit oldingi vizit "
+                    f"('{prev['mijoz']}') tugashidan OLDIN boshlangan"
+                )
+            elif gap_minutes < MIN_TRAVEL_MINUTES:
+                muammolar[curr["id"]].append(
+                    f"O'tish vaqti juda qisqa: '{prev['mijoz']}' dan '{curr['mijoz']}'gacha "
+                    f"atigi {gap_text} (chegara: {MIN_TRAVEL_MINUTES:.0f} daqiqa)"
+                )
+            elif gap_minutes >= MAX_IDLE_GAP_MINUTES:
+                # Vaqt yo'qotilishi alohida muammo sifatida qayd qilinadi.
+                muammolar[curr["id"]].append(
+                    f"Vaqt yo'qotilishi: '{prev['mijoz']}' viziti {prev['end_dt'].strftime('%H:%M:%S')} da tugagan, "
+                    f"'{curr['mijoz']}' viziti {curr['start_dt'].strftime('%H:%M:%S')} da boshlangan — "
+                    f"oradagi bo'sh vaqt {gap_text} (chegara: {MAX_IDLE_GAP_MINUTES:.0f} daqiqa)"
+                )
+
+    # Natijani ro'yxat shakliga o'tkazish
+    xatolar = []
+    for vizit_id, sabablar in muammolar.items():
+        r = row_by_id[vizit_id]
+        xatolar.append({
+            "id": r["id"],
+            "vaqt": r["vaqt_raw"],
+            "agent": r["agent"],
+            "mijoz": r["mijoz"],
+            "zona": r["zona"],
+            "sabablar": sabablar,
+        })
+
+    return xatolar
+
+
+# ---------------------------------------------------------------------------
+# HISOBOT TUZISH VA YUBORISH
+# ---------------------------------------------------------------------------
+def build_report(xatolar):
+    hozir = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    if not xatolar:
+        return (
+            f"✅ <b>VIZIT TEKSHIRUVI</b>\n"
+            f"🕐 {hozir}\n\n"
+            "🎉 <b>Muammoli vizitlar topilmadi.</b>"
+        )
+
+    agent_guruh = defaultdict(list)
+    for x in xatolar:
+        agent_guruh[x["agent"] or "Noma'lum"].append(x)
 
     lines = [
         "🚨 <b>VIZIT TEKSHIRUVI</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🕐 {now}",
-        f"🔴 Muammoli vizit: <b>{len(problems)}</b>",
-        f"📸 Foto 0: {'Ha' if CHECK_ZERO_PHOTO else 'Yo‘q'}",
-        f"📍 GPS chegara: {MAX_POGRESHNOST_METERS:.0f} m",
-        f"⏱ Vaqt chegara: {MAX_IDLE_GAP_MINUTES:.0f} daqiqa",
+        f"🕐 {hozir}",
+        f"🔴 <b>Muammoli vizitlar: {len(xatolar)} ta</b>",
+        f"⏱ <b>Vaqt yo'qotish chegarasi:</b> {MAX_IDLE_GAP_MINUTES:.0f} daqiqa",
         "",
     ]
 
-    item_counter = 0
-
-    for agent, items in sorted(
-        by_agent.items(),
-        key=lambda x: len(x[1]),
-        reverse=True,
-    ):
-        lines.append(
-            f"👤 <b>{esc(agent)}</b> — {len(items)} ta"
-        )
-
-        for item in items:
-            if MAX_REPORT_ITEMS and item_counter >= MAX_REPORT_ITEMS:
-                break
-
-            item_counter += 1
-
-            lines.extend(
-                [
-                    f"🏪 {esc(item['client'])}",
-                    f"🆔 {esc(item['id'])}",
-                    f"🕐 {esc(item['visit_time_raw'])}",
-                    "⚠️ " + ", ".join(
-                        esc(x) for x in item["reasons"]
-                    ),
-                    "",
-                ]
+    for agent, items in sorted(agent_guruh.items()):
+        lines.append(f"👤 <b>{html.escape(agent)}</b> — {len(items)} ta")
+        for i, x in enumerate(items, 1):
+            sabablar = "\n".join(f"      ⚠️ {html.escape(str(s))}" for s in x["sabablar"])
+            lines.append(
+                f"  <b>{i}.</b> 🏪 {html.escape(str(x['mijoz']))}\n"
+                f"      🆔 {html.escape(str(x['id']))}\n"
+                f"      🕐 {html.escape(str(x['vaqt']))}\n"
+                f"      {sabablar}"
             )
+        lines.append("")
 
-        if MAX_REPORT_ITEMS and item_counter >= MAX_REPORT_ITEMS:
-            break
-
-    if MAX_REPORT_ITEMS and len(problems) > MAX_REPORT_ITEMS:
-        lines.append(
-            f"ℹ️ Yana {len(problems) - MAX_REPORT_ITEMS} ta "
-            "muammo qisqartirildi."
-        )
-
+    lines.append("💡 <i>Vaqt yo'qotilishi — oldingi magazin tugagan va keyingi magazin boshlangan vaqt orasidagi bo'sh vaqt.</i>")
     return "\n".join(lines)
 
+def send_telegram_message(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    max_len = 3800
+    parts = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [text]
+    for part in parts:
+        resp = requests.post(url, data={
+            "chat_id": MANAGER_CHAT_ID,
+            "text": part,
+            "parse_mode": "HTML",
+        })
+        if resp.status_code != 200:
+            log.error(f"Telegramga yuborishda xato: {resp.text}")
 
-# ============================================================
-# AI DATA PACK
-# ============================================================
 
-def rows_for_ai(rows, agent=None, question=""):
-    scoped = rows
+# ---------------------------------------------------------------------------
+# AI SAVOL-JAVOB
+# ---------------------------------------------------------------------------
+def normalize_name(text):
+    text = str(text or "").lower().replace("ё", "е")
+    return re.sub(r"[^a-zа-яё0-9]+", " ", text).strip()
 
-    if agent:
-        scoped = [
-            r for r in rows
-            if r["agent"] == agent
-        ]
 
-    date_filter = detect_date_filter(question)
+def resolve_agent_for_user(message, rows):
+    """Telegram profilidan agentni ehtiyotkorlik bilan aniqlash."""
+    chat = message.get("chat") or {}
+    first = normalize_name(chat.get("first_name", ""))
+    last = normalize_name(chat.get("last_name", ""))
+    username = normalize_name(chat.get("username", ""))
+    profile = " ".join(x for x in [first, last, username] if x)
+    if not profile:
+        return None
 
-    if date_filter:
-        scoped = date_rows(scoped, date_filter)
+    agents = sorted({r.get("agent", "").strip() for r in rows if r.get("agent", "").strip()})
+    exact = []
+    for agent in agents:
+        a = normalize_name(agent)
+        if a and (a == profile or a in profile or profile in a):
+            exact.append(agent)
+    if len(exact) == 1:
+        return exact[0]
 
-    # ID bo'yicha savol bo'lsa faqat mos yozuvlar.
-    id_matches = find_by_id(scoped, question)
+    profile_tokens = set(profile.split())
+    scored = []
+    for agent in agents:
+        tokens = set(normalize_name(agent).split())
+        common = len(profile_tokens & tokens)
+        if common:
+            scored.append((common, agent))
+    if scored:
+        scored.sort(reverse=True)
+        best = scored[0]
+        if len(scored) == 1 or best[0] > scored[1][0]:
+            return best[1]
+    return None
 
-    if id_matches:
-        scoped = id_matches
 
-    # Client nomi aniq kelsa.
-    client_matches = find_by_client(scoped, question)
-
-    if client_matches:
-        scoped = client_matches
-
-    scoped = sorted(
-        scoped,
-        key=lambda x: x["start"] or datetime.min,
-        reverse=True,
-    )
-
-    # Savol umumiy bo'lsa, so'nggi yozuvlar yetarli bo'lmasligi
-    # mumkin. Shu sababli aggregate + muammoli + recent yozuvlarni
-    # birga beramiz.
-    selected = []
-
-    if id_matches or client_matches or date_filter:
-        selected = scoped[:MAX_AI_ROWS]
+def compact_rows_for_ai(rows, agent_name=None, max_rows=700):
+    if agent_name:
+        filtered = [r for r in rows if r.get("agent") == agent_name]
     else:
-        # Muammoli vizitlar
-        problems = [
-            r for r in scoped
-            if visit_has_problem(r)
-        ]
+        filtered = list(rows)
 
-        # Eng katta gaplar
-        gaps = [
-            r for r in scoped
-            if r.get("gap_minutes") is not None
-            and r["gap_minutes"] >= MAX_IDLE_GAP_MINUTES
-        ]
+    # Eng yangi yozuvlarni oldinga qo'yamiz.
+    filtered.sort(key=lambda r: r.get("start_dt") or datetime.min, reverse=True)
+    filtered = filtered[:max_rows]
 
-        gaps.sort(
-            key=lambda x: x["gap_minutes"],
-            reverse=True,
+    # AI uchun ketma-ket vizitlar orasidagi vaqtni Python oldindan hisoblab beradi.
+    # Shunda Gemini vaqtni taxmin qilmaydi, tayyor aniq qiymatni tushuntiradi.
+    by_agent = defaultdict(list)
+    for r in filtered:
+        if r.get("start_dt") is not None:
+            by_agent[r.get("agent", "")].append(r)
+
+    idle_by_id = {}
+    for agent, agent_rows in by_agent.items():
+        agent_rows.sort(key=lambda x: x.get("start_dt") or datetime.min)
+        for prev, curr in zip(agent_rows, agent_rows[1:]):
+            if not prev.get("end_dt") or not curr.get("start_dt"):
+                continue
+            if prev["end_dt"].date() != curr["start_dt"].date():
+                continue
+            gap_seconds = int((curr["start_dt"] - prev["end_dt"]).total_seconds())
+            if gap_seconds >= 0:
+                idle_by_id[curr.get("id", "")] = {
+                    "previous_client": prev.get("mijoz", ""),
+                    "previous_end": prev["end_dt"].strftime(DATETIME_FORMAT),
+                    "next_client": curr.get("mijoz", ""),
+                    "next_start": curr["start_dt"].strftime(DATETIME_FORMAT),
+                    "gap_minutes": round(gap_seconds / 60, 2),
+                    "is_idle_problem": gap_seconds / 60 >= MAX_IDLE_GAP_MINUTES,
+                    "is_too_short": gap_seconds / 60 < MIN_TRAVEL_MINUTES,
+                }
+
+    result = []
+    for r in filtered:
+        result.append({
+            "id": r.get("id", ""),
+            "agent": r.get("agent", ""),
+            "client": r.get("mijoz", ""),
+            "zone": r.get("zona", ""),
+            "visit_time": r.get("vaqt_raw", ""),
+            "start": r.get("start_dt").strftime(DATETIME_FORMAT) if r.get("start_dt") else "",
+            "end": r.get("end_dt").strftime(DATETIME_FORMAT) if r.get("end_dt") else "",
+            "gps_m": r.get("pogreshnost_m", 0),
+            "gps_raw": str(r.get("pogreshnost_raw", "")),
+            "photos": r.get("foto_soni", 0),
+            "previous_visit_gap": idle_by_id.get(r.get("id", ""), {}),
+        })
+    return result
+
+
+def ask_gemini(question, rows, agent_name=None):
+    if not GEMINI_API_KEY:
+        return (
+            "⚠️ AI savol-javob hali yoqilmagan. Railway Variables'da "
+            "GEMINI_API_KEY variable qo'shing."
         )
 
-        # Recent
-        recent = scoped[:80]
-
-        seen = set()
-
-        for r in problems + gaps + recent:
-            key = r.get("id") or id(r)
-
-            if key not in seen:
-                selected.append(r)
-                seen.add(key)
-
-            if len(selected) >= MAX_AI_ROWS:
-                break
-
-    return [
-        {
-            "id": r["id"],
-            "agent": r["agent"],
-            "client": r["client"],
-            "zone": r["zone"],
-            "visit_time": r["visit_time_raw"],
-            "start": (
-                r["start"].strftime(DATETIME_FORMAT)
-                if r["start"] else ""
-            ),
-            "end": (
-                r["end"].strftime(DATETIME_FORMAT)
-                if r["end"] else ""
-            ),
-            "gps_m": round(r["gps_m"], 1),
-            "photos": r["photos"],
-            "gap_minutes": r.get("gap_minutes"),
-            "previous_client": r.get("previous_client", ""),
-            "previous_end": (
-                r["previous_end"].strftime(DATETIME_FORMAT)
-                if r.get("previous_end")
-                else ""
-            ),
-            "gap_problem": bool(r.get("gap_problem")),
-            "too_short": bool(r.get("too_short")),
-            "problems": visit_has_problem(r),
-        }
-        for r in selected
-    ]
-
-
-def build_ai_summary(rows, agent=None):
-    scoped = [
-        r for r in rows
-        if not agent or r["agent"] == agent
-    ]
-
-    stats = agent_stats(scoped)
-
-    today = date_rows(scoped, datetime.now().date())
-
-    ranking = build_agent_ranking(rows)[:15]
-    gap_ranking = build_gap_ranking(scoped)[:20]
-
-    return {
-        "scope_agent": agent or "MANAGER_ALL_AGENTS",
-        "total_rows": len(scoped),
-        "today": agent_stats(today),
-        "overall": stats,
-        "agents_count": len(
-            {
-                r["agent"]
-                for r in scoped
-                if r["agent"]
-            }
-        ),
-        "agent_ranking": ranking,
-        "largest_time_losses": [
-            {
-                "agent": r["agent"],
-                "id": r["id"],
-                "previous_client": r["previous_client"],
-                "previous_end": (
-                    r["previous_end"].strftime(DATETIME_FORMAT)
-                    if r.get("previous_end")
-                    else ""
-                ),
-                "next_client": r["client"],
-                "next_start": (
-                    r["start"].strftime(DATETIME_FORMAT)
-                    if r.get("start")
-                    else ""
-                ),
-                "gap_minutes": r["gap_minutes"],
-            }
-            for r in gap_ranking
-        ],
-    }
-
-
-# ============================================================
-# GEMINI
-# ============================================================
-
-def gemini_request(system_text, user_text):
-    if not GEMINI_API_KEY:
-        return None, "GEMINI_API_KEY topilmadi."
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
+    data = compact_rows_for_ai(rows, agent_name=agent_name)
+    today = datetime.now().strftime("%d.%m.%Y")
+    scope = (
+        f"Foydalanuvchi agent: {agent_name}. Faqat shu agent ma'lumotlari haqida javob ber."
+        if agent_name
+        else "Foydalanuvchi menejer. Barcha agentlar ma'lumotidan foydalanish mumkin."
     )
 
+    system = f"""
+Sen Telegramdagi Vizitlar analitika yordamchisisan.
+Bugungi sana: {today}.
+{scope}
+
+Qoidalar:
+1. Javobni faqat berilgan Google Sheets ma'lumotlariga tayab ber.
+2. Savol oldindan kodga yozilmagan bo'lsa ham, ma'nosini tushunib javob ber.
+3. 'bugun', 'kecha', 'shu oy', 'eng ko'p', 'nechta', 'qaysi klient' kabi savollarni ma'lumotdan hisobla.
+4. Sonlarni aniq hisobla. Hisoblash imkoni bo'lmasa, buni ochiq ayt.
+5. Ma'lumotda yo'q narsani o'ylab topma.
+6. Telegram uchun qisqa, tushunarli o'zbek tilida yoz. Kerak bo'lsa ruscha mijoz/agent nomlarini aynan saqla.
+7. Hisobot bo'lsa emoji va punktlardan foydalan. Juda uzun jadval chiqarmagin.
+8. 'GPS xatosi' uchun gps_m, foto uchun photos ustunidan foydalan.
+9. 'muammoli vizit' deganda GPS > MAX_POGRESHNOST_METERS yoki photos=0 yoki tekshiruvdagi vaqt muammolarini hisobga ol.
+10. Agar foydalanuvchi "vaqt yo'qotilishi", "orasida qancha vaqt", "qaysi magazinlar orasida vaqt ketgan" deb so'rasa, har bir agentning ketma-ket vizitlarini tartib bilan ko'rib chiq: oldingi vizitning Konец визита va keyingi vizitning Начала визита orasini hisobla. MAX_IDLE_GAP_MINUTES dan katta bo'lsa muammo sifatida ko'rsat. Javobda oldingi magazin, tugagan vaqt, keyingi magazin, boshlangan vaqt va yo'qotilgan vaqtni ko'rsat.
+11. Agar "ID bo'yicha" deyilsa, vizitning ИД maydonini ham javobga qo'sh.
+12. Javob oxirida qisqa xulosa ber.
+
+Tekshiruv chegaralari:
+- GPS: {MAX_POGRESHNOST_METERS} metr
+- Foto 0: {'ha' if CHECK_ZERO_PHOTO else 'yo\'q'}
+- Minimal o'tish vaqti: {MIN_TRAVEL_MINUTES} daqiqa
+- Vaqt yo'qotilishi chegarasi: {MAX_IDLE_GAP_MINUTES} daqiqa
+
+Google Sheets ma'lumotlari JSON:
+{json.dumps(data, ensure_ascii=False, default=str)}
+"""
+
+    # Gemini API REST: rasmiy generateContent endpoint.
+    # API key faqat Railway Environment Variable orqali olinadi.
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     payload = {
-        "systemInstruction": {
-            "parts": [
-                {"text": system_text}
-            ]
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": user_text}
-                ],
-            }
-        ],
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": question}]}],
         "generationConfig": {
-            "temperature": 0.15,
-            "maxOutputTokens": 1800,
+            "temperature": 0.2,
+            "maxOutputTokens": 1600,
         },
     }
-
     try:
-        response = requests.post(
+        resp = requests.post(
             url,
             headers={
                 "x-goog-api-key": GEMINI_API_KEY,
@@ -1312,726 +549,223 @@ def gemini_request(system_text, user_text):
             json=payload,
             timeout=GEMINI_TIMEOUT,
         )
-
-        if response.status_code != 200:
-            log.error(
-                "Gemini %s: %s",
-                response.status_code,
-                response.text[:1200],
-            )
-            return None, (
-                f"Gemini API xatosi: {response.status_code}"
-            )
-
-        body = response.json()
-
-        candidates = body.get("candidates") or []
-
+        if resp.status_code != 200:
+            log.error(f"Gemini API xatosi: {resp.text[:1000]}")
+            return f"⚠️ AI javobida xato: {resp.status_code}. Railway logini tekshiring."
+        body = resp.json()
+        candidates = body.get("candidates", [])
         if not candidates:
-            return None, "Gemini javob qaytarmadi."
-
-        parts = (
-            candidates[0]
-            .get("content", {})
-            .get("parts", [])
-        )
-
-        text = "\n".join(
-            p.get("text", "")
-            for p in parts
-            if p.get("text")
-        ).strip()
-
-        if not text:
-            return None, "Gemini bo'sh javob qaytardi."
-
-        return text, None
-
+            return "⚠️ AI javob qaytarmadi. Savolni boshqacha yozib ko'ring."
+        parts = candidates[0].get("content", {}).get("parts", [])
+        answer = "\n".join(p.get("text", "") for p in parts if p.get("text"))
+        return answer.strip() or "⚠️ AI bo'sh javob qaytardi."
     except requests.RequestException as e:
-        log.exception("Gemini network error")
-        return None, f"Gemini bilan ulanish xatosi: {e}"
-
-
-def clean_ai_answer(text):
-    if not text:
-        return text
-
-    # Gemini ba'zida Markdown yuboradi. Telegram HTML bilan
-    # aralashmasligi uchun oddiy markdown belgilarini yumshatamiz.
-    text = text.replace("```html", "")
-    text = text.replace("```", "")
-    text = text.strip()
-
-    # Oddiy Markdown bold formatini Telegram HTML'ga o'tkazamiz.
-    text = re.sub(r"\\*\\*(.+?)\\*\\*", r"<b>\\1</b>", text)
-
-    # Agar AI <...> ishlatsa, Telegram HTML bo'lishi mumkin.
-    # Lekin noma'lum HTML teglarini buzmaslik uchun faqat xavfsiz
-    # teglarni qoldiramiz.
-    allowed = {
-        "b", "strong", "i", "em", "u", "s",
-        "code", "pre", "blockquote",
-    }
-
-    def replace_tag(match):
-        slash = match.group(1) or ""
-        tag = match.group(2).lower()
-
-        if tag in allowed:
-            return f"<{slash}{tag}>"
-
-        return ""
-
-    text = re.sub(
-        r"<(/?)([a-zA-Z0-9]+)[^>]*>",
-        replace_tag,
-        text,
-    )
-
-    return text.strip()
-
-
-def ask_gemini_about_visits(
-    question,
-    rows,
-    agent=None,
-):
-    summary = build_ai_summary(rows, agent=agent)
-    data = rows_for_ai(
-        rows,
-        agent=agent,
-        question=question,
-    )
-
-    scope_text = (
-        f"Bu savolni {agent} agent nomidan berilgan deb qabul qil. "
-        "Faqat shu agent ma'lumotidan foydalan."
-        if agent
-        else
-        "Foydalanuvchi menejer. Barcha agentlar bo'yicha ma'lumotdan foydalan."
-    )
-
-    system = f"""
-Sen professional Telegram BI / Vizit Analytics yordamchisisan.
-
-{scope_text}
-
-Bugungi sana:
-{datetime.now():%d.%m.%Y}
-
-Sistemadagi ustunlar:
-- ИД = vizit ID
-- Пользователь = agent
-- Клиент = magazin/mijoz
-- Рабочая зона = zona
-- Начала визита = vizit boshlanishi
-- Конец визита = vizit tugashi
-- Погрешность = GPS xatosi
-- Фото = foto soni
-
-Muhim hisoblash qoidalari:
-- GPS muammo: {MAX_POGRESHNOST_METERS} metrdan katta.
-- Fotosiz muammo: Фото = 0.
-- Vaqt yo'qotish: oldingi vizitning Konец визита -> keyingi vizitning Начала визита.
-- Vaqt yo'qotish muammosi: {MAX_IDLE_GAP_MINUTES} daqiqadan katta yoki teng.
-- Juda qisqa o'tish: {MIN_TRAVEL_MINUTES} daqiqadan kichik.
-- Tugamagan vizit: Конец визита yo'q.
-
-QAT'IY QOIDALAR:
-1. Faqat berilgan ma'lumotlardan foydalan.
-2. Ma'lumotda yo'q narsani o'ylab topma.
-3. Sonlarni o'zingcha taxmin qilma.
-4. "Bugun", "kecha", "eng ko'p", "eng kam", "qaysi agent",
-   "qaysi magazin", "qancha vaqt" kabi savollarni tushun.
-5. Savol oldindan kodga yozilmagan bo'lsa ham, tabiiy tilda tushun.
-6. Agar savol noaniq bo'lsa, mavjud ma'lumot asosida eng yaqin javobni ber,
-   kerak bo'lsa bitta qisqa aniqlashtiruvchi savol so'ra.
-7. Javob o'zbek tilida bo'lsin.
-8. Agent/magazin nomlarini Sheets'dagi kabi saqla.
-9. Telegram uchun mini-dashboard uslubida yoz.
-10. Javobni qisqa, ammo mazmunli qil.
-11. Kerak bo'lsa quyidagi bloklardan foydalan:
-   📊 Sarlavha
-   ━━━━━━━━━━━━━━━━━━━
-   👤 Agent
-   👣 Vizitlar
-   📸 Foto
-   📍 GPS
-   ⏱ Vaqt
-   🔴 Muammo
-   ✅ Xulosa
-12. Vaqt yo'qotish haqida savol bo'lsa:
-   oldingi magazin + tugash vaqti + keyingi magazin +
-   boshlanish vaqti + yo'qotilgan vaqtni ko'rsat.
-13. ID bo'yicha savolda IDni ko'rsat.
-14. Agar savol "eng faol agent", "eng ko'p vizit" bo'lsa rankingdan foydalan.
-15. "eng muammoli agent" deyilganda muammo soni bo'yicha tushuntir,
-   "eng yaxshi" yoki "eng yomon" degan bahoni o'zingcha bermagin.
-16. Agar ma'lumot yetarli bo'lmasa, "ma'lumot yetarli emas" deb ayt.
-
-AGGREGATE DASHBOARD:
-{json.dumps(summary, ensure_ascii=False, default=str)}
-
-SAVOLGA MOS TANLANGAN VIZITLAR:
-{json.dumps(data, ensure_ascii=False, default=str)}
-"""
-
-    answer, error = gemini_request(
-        system,
-        question,
-    )
-
-    if error:
-        return (
-            "⚠️ <b>AI javobida muammo</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"{esc(error)}"
-        )
-
-    return clean_ai_answer(answer)
-
-
-# ============================================================
-# COMMAND HANDLERS
-# ============================================================
-
-def is_manager(chat_id):
-    return (
-        bool(MANAGER_CHAT_ID)
-        and str(chat_id) == str(MANAGER_CHAT_ID)
-    )
-
-
-def start_message():
-    return (
-        "👋 <b>Assalomu alaykum!</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <b>Vizit AI Analytics</b> ishlayapti.\n\n"
-        "Men Google Sheets'dagi vizitlarni tahlil qilaman.\n\n"
-        "💬 Istalgan savolni oddiy tilda yozing:\n"
-        "• Bugun nechta vizit qildim?\n"
-        "• Eng ko'p vaqt qayerda yo'qoldi?\n"
-        "• Fotosiz vizitlarim nechta?\n"
-        "• ID 2040272965 bo'yicha nima bo'lgan?\n"
-        "• Eng ko'p vizit qilgan agentlar?\n\n"
-        "📌 <b>Buyruqlar:</b>\n"
-        "/dashboard — umumiy dashboard\n"
-        "/my — o'zingiz bo'yicha dashboard\n"
-        "/photos — fotosiz vizitlar\n"
-        "/gaps — vaqt yo'qotishlari\n"
-        "/top — eng ko'p vizit qilganlar\n"
-        "/problems — muammoli agentlar\n"
-        "/status — bot holati\n"
-        "/check — tekshiruv (menejer)"
-    )
-
-
-def status_message():
-    cache_age = (
-        time.time() - _DATA_CACHE["loaded_at"]
-        if _DATA_CACHE["rows"] is not None
-        else None
-    )
-
-    cache_text = (
-        f"{cache_age:.0f} soniya"
-        if cache_age is not None
-        else "hali yuklanmagan"
-    )
-
-    return (
-        "🟢 <b>BOT STATUS</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 Telegram: faol\n"
-        f"🧠 Gemini: {'ulangan' if GEMINI_API_KEY else 'ulanmagan'}\n"
-        f"📊 Google Sheets: "
-        f"{'ulangan' if GOOGLE_SHEET_ID else 'ID yo‘q'}\n"
-        f"💾 Cache yoshi: {cache_text}\n"
-        f"⏱ Avtomatik tekshiruv: "
-        f"{CHECK_INTERVAL_SECONDS // 60} daqiqa"
-    )
-
-
-def resolve_scope(message, rows):
-    chat_id = (message.get("chat") or {}).get("id")
-
-    if is_manager(chat_id):
-        return None, True
-
-    agent = resolve_agent_from_message(
-        message,
-        rows,
-    )
-
-    return agent, False
-
-
-def handle_command(message, text, rows):
-    command = normalize_text(text)
-
-    if command.startswith("/start"):
-        return start_message()
-
-    if command in {"/status", "status"}:
-        return status_message()
-
-    if command in {"/dashboard", "dashboard"}:
-        agent, manager = resolve_scope(message, rows)
-
-        if not manager and not agent:
-            return (
-                "⚠️ <b>Agent aniqlanmadi.</b>\n"
-                "Telegram profilingizdagi ism/familiya "
-                "Google Sheets'dagi Пользователь bilan mos kelmadi."
-            )
-
-        return format_agent_dashboard(
-            rows,
-            agent=None if manager else agent,
-        )
-
-    if command in {"/my", "my"}:
-        agent, manager = resolve_scope(message, rows)
-
-        if manager:
-            return format_agent_dashboard(rows)
-
-        if not agent:
-            return (
-                "⚠️ Agentni aniqlay olmadim.\n"
-                "Telegram profilingizdagi ism/familiyani "
-                "Google Sheets'dagi Пользователь bilan moslang."
-            )
-
-        return format_agent_dashboard(
-            rows,
-            agent=agent,
-        )
-
-    if command in {"/photos", "photos"}:
-        agent, manager = resolve_scope(message, rows)
-
-        if not manager and not agent:
-            return "⚠️ Agent aniqlanmadi."
-
-        scoped = (
-            rows if manager
-            else [r for r in rows if r["agent"] == agent]
-        )
-
-        return format_photo_dashboard(scoped)
-
-    if command in {"/gaps", "gaps"}:
-        agent, manager = resolve_scope(message, rows)
-
-        if not manager and not agent:
-            return "⚠️ Agent aniqlanmadi."
-
-        scoped = (
-            rows if manager
-            else [r for r in rows if r["agent"] == agent]
-        )
-
-        return format_gap_dashboard(scoped)
-
-    if command in {"/top", "top"}:
-        if not is_manager(
-            (message.get("chat") or {}).get("id")
-        ):
-            return (
-                "⛔ Bu dashboard faqat menejer uchun."
-            )
-
-        return format_top_agents(rows)
-
-    if command in {"/problems", "problems"}:
-        if not is_manager(
-            (message.get("chat") or {}).get("id")
-        ):
-            return (
-                "⛔ Bu dashboard faqat menejer uchun."
-            )
-
-        return format_top_problem_agents(rows)
-
-    if command in {"/check", "check", "tekshir"}:
-        chat_id = (message.get("chat") or {}).get("id")
-
-        if not is_manager(chat_id):
-            return "⛔ Bu buyruq faqat menejer uchun."
-
-        if not _CHECK_LOCK.acquire(blocking=False):
-            return "⏳ Tekshiruv allaqachon bajarilmoqda."
-
-        try:
-            fresh_rows = get_rows(force=True)
-            return format_check_report(fresh_rows)
-        except Exception as e:
-            log.exception("Manual check error")
-            return f"🚨 Tekshiruv xatosi: {esc(e)}"
-        finally:
-            _CHECK_LOCK.release()
-
-    return None
-
-
-# ============================================================
-# TELEGRAM API
-# ============================================================
-
-def telegram_url(method):
-    return (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/{method}"
-    )
-
-
-def telegram_send(chat_id, text):
-    if not text:
-        return
-
-    # Telegram limit ~4096. 3800 xavfsizroq.
-    max_len = 3800
-
-    parts = []
-
-    while len(text) > max_len:
-        cut = text.rfind("\n", 0, max_len)
-
-        if cut < 1000:
-            cut = max_len
-
-        parts.append(text[:cut])
-        text = text[cut:].lstrip()
-
-    parts.append(text)
-
-    for part in parts:
-        try:
-            response = requests.post(
-                telegram_url("sendMessage"),
-                data={
-                    "chat_id": chat_id,
-                    "text": part,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": "true",
-                },
-                timeout=15,
-            )
-
-            if response.status_code != 200:
-                log.error(
-                    "Telegram sendMessage xatosi: %s",
-                    response.text[:1000],
-                )
-
-        except requests.RequestException:
-            log.exception(
-                "Telegram sendMessage network error"
-            )
-
-
-def telegram_typing(chat_id):
+        log.exception("Gemini API tarmoq xatosi")
+        return f"⚠️ AI bilan ulanishda xato: {e}"
+    except Exception as e:
+        log.exception("AI savol-javob xatosi")
+        return f"⚠️ AI javobini tayyorlashda xato: {e}"
+
+
+def answer_user_question(message, text):
+    """Oddiy savolni Google Sheets + Gemini orqali javobga aylantiradi."""
     try:
-        requests.post(
-            telegram_url("sendChatAction"),
-            data={
-                "chat_id": chat_id,
-                "action": "typing",
-            },
-            timeout=5,
+        client = get_sheet_client()
+        rows = load_and_parse_rows(client)
+    except Exception as e:
+        log.exception("Savol uchun Sheets o'qishda xato")
+        return f"🚨 Ma'lumotlarni o'qib bo'lmadi: {e}"
+
+    chat_id = (message.get("chat") or {}).get("id")
+    is_manager = bool(MANAGER_CHAT_ID and str(chat_id) == str(MANAGER_CHAT_ID))
+    agent_name = None if is_manager else resolve_agent_for_user(message, rows)
+
+    if not is_manager and not agent_name:
+        return (
+            "⚠️ Telegram profilingizni agent bilan bog'lay olmadim.\n\n"
+            "Iltimos, menejerga Telegram profilingizdagi ism/familiyangizni "
+            "agent nomi bilan moslab berishni ayting."
         )
-    except Exception:
-        pass
+
+    return ask_gemini(text, rows, agent_name=agent_name)
 
 
-# ============================================================
-# TELEGRAM POLLING
-# ============================================================
-
+# ---------------------------------------------------------------------------
+# TELEGRAM BOT — oddiy javoblar (/start, salom va h.k.)
+# ---------------------------------------------------------------------------
 def telegram_polling():
+    """
+    Railway'da webhook'siz ishlaydi.
+    Botga /start yoki oddiy 'salom' yozilsa javob beradi.
+    """
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN topilmadi.")
         return
 
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     offset = 0
 
-    # Eski update'larni o'tkazib yuborish.
+    # Eski update'larni qayta yubormaslik uchun ularni tashlab ketamiz.
     try:
-        response = requests.get(
-            telegram_url("getUpdates"),
-            params={
-                "offset": -1,
-                "timeout": 1,
-                "allowed_updates": json.dumps(["message"]),
-            },
+        r = requests.get(
+            f"{api_url}/getUpdates",
+            params={"offset": -1, "timeout": 1},
             timeout=5,
         )
-
-        data = response.json()
-
+        data = r.json()
         if data.get("ok") and data.get("result"):
-            offset = (
-                data["result"][-1]["update_id"] + 1
-            )
-
+            offset = data["result"][-1]["update_id"] + 1
     except Exception as e:
-        log.warning(
-            "Telegram initial update error: %s",
-            e,
-        )
+        log.warning(f"Telegram boshlang'ich update tekshiruvi: {e}")
 
     log.info("Telegram polling ishga tushdi.")
 
     while True:
         try:
             response = requests.get(
-                telegram_url("getUpdates"),
-                params={
-                    "offset": offset,
-                    "timeout": 30,
-                    "allowed_updates": json.dumps(
-                        ["message"]
-                    ),
-                },
+                f"{api_url}/getUpdates",
+                params={"offset": offset, "timeout": 30},
                 timeout=40,
             )
 
-            if response.status_code == 409:
-                log.error(
-                    "Telegram 409 Conflict: boshqa bot instance "
-                    "getUpdates ishlatyapti. 20 soniya kutaman."
-                )
-                time.sleep(20)
-                continue
-
             if response.status_code != 200:
-                log.error(
-                    "Telegram getUpdates %s: %s",
-                    response.status_code,
-                    response.text[:1000],
-                )
-                time.sleep(5)
+                log.error(f"Telegram getUpdates xatosi: {response.text}")
+                time.sleep(3)
                 continue
 
             data = response.json()
-
             if not data.get("ok"):
-                log.error(
-                    "Telegram API error: %s",
-                    data,
-                )
-                time.sleep(5)
+                log.error(f"Telegram API xatosi: {data}")
+                time.sleep(3)
                 continue
 
             for update in data.get("result", []):
-                offset = (
-                    update["update_id"] + 1
-                )
+                offset = update["update_id"] + 1
 
                 message = update.get("message") or {}
                 chat = message.get("chat") or {}
                 chat_id = chat.get("id")
-                text = (
-                    message.get("text") or ""
-                ).strip()
+                text = (message.get("text") or "").strip()
 
-                if not chat_id or not text:
+                if not chat_id:
                     continue
 
-                try:
-                    rows = get_rows()
-
-                    reply = handle_command(
-                        message,
-                        text,
-                        rows,
+                # /start
+                if text.lower().startswith("/start"):
+                    reply = (
+                        "👋 Assalomu alaykum!\n\n"
+                        "🤖 Vizit tekshiruv boti ishlayapti.\n"
+                        "Men Google Sheets'dagi vizitlarni tekshiraman.\n\n"
+                        "📊 Tekshiruv avtomatik ravishda "
+                        f"har {CHECK_INTERVAL_SECONDS // 60} daqiqada bajariladi."
                     )
 
-                    if reply is None:
-                        # Oddiy savol -> Gemini.
-                        agent, manager = resolve_scope(
-                            message,
-                            rows,
+                # Oddiy salomlashuv
+                elif text.lower() in {
+                    "salom", "salam", "hello", "hi",
+                    "assalomu alaykum", "assalom"
+                }:
+                    reply = (
+                        "👋 Va alaykum assalom!\n"
+                        "🤖 Bot ishlayapti. Vizitlar tekshiruvi faol."
+                    )
+
+                elif text.lower() in {"/status", "status"}:
+                    reply = (
+                        "🟢 Bot ishlayapti.\n"
+                        f"⏱ Tekshiruv intervali: {CHECK_INTERVAL_SECONDS // 60} daqiqa"
+                    )
+
+                elif text.lower() in {"/check", "check", "tekshir"}:
+                    # Faqat menejer uchun qo'lda tekshiruv.
+                    if MANAGER_CHAT_ID and str(chat_id) == str(MANAGER_CHAT_ID):
+                        reply = "🔎 Vizit tekshiruvi boshlandi..."
+                        try:
+                            xatolar = check_visits()
+                            report = build_report(xatolar)
+                            send_telegram_message(report)
+                            # Alohida status xabari
+                            requests.post(
+                                f"{api_url}/sendMessage",
+                                data={
+                                    "chat_id": chat_id,
+                                    "text": f"✅ Tekshiruv tugadi. Muammoli vizitlar: {len(xatolar)}",
+                                },
+                                timeout=10,
+                            )
+                            continue
+                        except Exception as e:
+                            reply = f"🚨 Tekshiruv xatosi: {e}"
+                    else:
+                        reply = "⛔ Bu buyruq faqat menejer uchun."
+
+                else:
+                    # Endi kiritilmagan savollar ham AI orqali tahlil qilinadi.
+                    reply = "⏳ Savolingizni tahlil qilyapman..."
+                    try:
+                        # Avval foydalanuvchiga kutish holatini yuboramiz.
+                        requests.post(
+                            f"{api_url}/sendChatAction",
+                            data={"chat_id": chat_id, "action": "typing"},
+                            timeout=5,
                         )
+                        reply = answer_user_question(message, text)
+                    except Exception as e:
+                        log.exception("Savolga javob berishda xato")
+                        reply = f"🚨 Savolni qayta ishlashda xato: {e}"
 
-                        if not manager and not agent:
-                            reply = (
-                                "⚠️ <b>Agentni aniqlay olmadim.</b>\n"
-                                "━━━━━━━━━━━━━━━━━━━━\n"
-                                "Telegram profilingizdagi ism/familiya "
-                                "Google Sheets'dagi Пользователь bilan "
-                                "mos kelmadi.\n\n"
-                                "Menejer sifatida barcha agentlar "
-                                "bo'yicha savol berish uchun MANAGER_CHAT_ID "
-                                "to'g'ri qo'yilganini tekshiring."
-                            )
-                        else:
-                            telegram_typing(chat_id)
-
-                            reply = ask_gemini_about_visits(
-                                text,
-                                rows,
-                                agent=None if manager else agent,
-                            )
-
-                    telegram_send(
-                        chat_id,
-                        reply,
-                    )
-
-                except Exception as e:
-                    log.exception(
-                        "Update qayta ishlashda xato"
-                    )
-
-                    telegram_send(
-                        chat_id,
-                        "🚨 <b>Xatolik</b>\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n"
-                        f"{esc(e)}",
-                    )
+                requests.post(
+                    f"{api_url}/sendMessage",
+                    data={
+                        "chat_id": chat_id,
+                        "text": reply,
+                    },
+                    timeout=10,
+                )
 
         except requests.RequestException as e:
-            log.warning(
-                "Telegram polling network error: %s",
-                e,
-            )
-            time.sleep(5)
-
+            log.warning(f"Telegram polling tarmoq xatosi: {e}")
+            time.sleep(3)
         except Exception:
-            log.exception(
-                "Telegram polling unexpected error"
-            )
-            time.sleep(5)
+            log.exception("Telegram polling paytida xato")
+            time.sleep(3)
 
 
-# ============================================================
-# AUTOMATIC CHECK
-# ============================================================
-
-def run_once(send_report=True):
+# ---------------------------------------------------------------------------
+# ASOSIY ISHGA TUSHIRISH
+# ---------------------------------------------------------------------------
+def run_once():
     log.info("Tekshiruv boshlandi...")
-
     try:
-        rows = get_rows(force=True)
-        report = format_check_report(rows)
-
-        if send_report:
-            telegram_send(
-                MANAGER_CHAT_ID,
-                report,
-            )
-
-        problems = len(
-            get_problem_visits(rows)
-        )
-
-        log.info(
-            "Tekshiruv tugadi. Muammoli vizitlar: %s",
-            problems,
-        )
-
-        return report
-
+        xatolar = check_visits()
+        report = build_report(xatolar)
+        send_telegram_message(report)
+        log.info(f"Tekshiruv tugadi. Muammoli vizitlar: {len(xatolar)}")
     except Exception as e:
-        log.exception(
-            "Tekshiruv paytida xato"
-        )
-
-        if send_report and MANAGER_CHAT_ID:
-            telegram_send(
-                MANAGER_CHAT_ID,
-                "🚨 <b>BOT XATOSI</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"{esc(e)}",
-            )
-
-        return None
+        log.exception("Tekshiruv paytida xato yuz berdi")
+        try:
+            send_telegram_message(f"🚨 Bot xatosi: {e}")
+        except Exception:
+            pass
 
 
 def run_forever():
-    log.info(
-        "Bot doimiy rejimda. Interval=%s soniya.",
-        CHECK_INTERVAL_SECONDS,
-    )
+    log.info(f"Bot doimiy rejimda ishga tushdi. Har {CHECK_INTERVAL_SECONDS} soniyada tekshiradi.")
 
-    telegram_thread = threading.Thread(
-        target=telegram_polling,
-        daemon=True,
-        name="telegram-polling",
-    )
-
+    # Telegram polling alohida oqimda ishlaydi.
+    import threading
+    telegram_thread = threading.Thread(target=telegram_polling, daemon=True)
     telegram_thread.start()
 
+    # Asosiy oqim vizitlarni reja bo'yicha tekshiradi.
     while True:
-        try:
-            if _CHECK_LOCK.acquire(blocking=False):
-                try:
-                    run_once(send_report=True)
-                finally:
-                    _CHECK_LOCK.release()
-            else:
-                log.info(
-                    "Oldingi tekshiruv hali tugamagan."
-                )
-
-        except Exception:
-            log.exception(
-                "Main loop error"
-            )
-
+        run_once()
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
-# ============================================================
-# STARTUP VALIDATION
-# ============================================================
-
-def validate_config():
-    missing = []
-
-    if not GOOGLE_SHEET_ID:
-        missing.append("GOOGLE_SHEET_ID")
-
-    if not GOOGLE_CREDENTIALS_JSON and not os.path.exists(
-        GOOGLE_CREDENTIALS_FILE
-    ):
-        missing.append(
-            "GOOGLE_CREDENTIALS_JSON"
-        )
-
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-
-    if not MANAGER_CHAT_ID:
-        missing.append("MANAGER_CHAT_ID")
-
-    if missing:
-        log.warning(
-            "Yetishmayotgan ENV: %s",
-            ", ".join(missing),
-        )
-
-    if GEMINI_API_KEY:
-        log.info(
-            "Gemini: %s",
-            GEMINI_MODEL,
-        )
-    else:
-        log.warning(
-            "GEMINI_API_KEY yo'q. Savol-javob AI ishlamaydi."
-        )
-
-
-# ============================================================
-# ENTRY
-# ============================================================
-
 if __name__ == "__main__":
-    validate_config()
-
+    import sys
     if "--once" in sys.argv:
-        run_once(send_report=True)
+        run_once()
     else:
         run_forever()
