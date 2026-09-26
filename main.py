@@ -1,6 +1,4 @@
-from pathlib import Path
-
-main_code = r'''"""
+"""
 VIZIT AI ANALYTICS BOT — Railway / Google Sheets / Telegram / Gemini
 ====================================================================
 
@@ -1364,6 +1362,9 @@ def clean_ai_answer(text):
     text = text.replace("```", "")
     text = text.strip()
 
+    # Oddiy Markdown bold formatini Telegram HTML'ga o'tkazamiz.
+    text = re.sub(r"\\*\\*(.+?)\\*\\*", r"<b>\\1</b>", text)
+
     # Agar AI <...> ishlatsa, Telegram HTML bo'lishi mumkin.
     # Lekin noma'lum HTML teglarini buzmaslik uchun faqat xavfsiz
     # teglarni qoldiramiz.
@@ -2034,27 +2035,3 @@ if __name__ == "__main__":
         run_once(send_report=True)
     else:
         run_forever()
-'''
-
-requirements = """gspread
-google-auth
-requests
-python-dotenv
-"""
-
-out_dir = Path("/mnt/data/visit_bot_rebuild")
-out_dir.mkdir(parents=True, exist_ok=True)
-
-main_path = out_dir / "main.py"
-req_path = out_dir / "requirements.txt"
-
-main_path.write_text(main_code, encoding="utf-8")
-req_path.write_text(requirements, encoding="utf-8")
-
-# Syntax check before giving the files to the user.
-import py_compile
-py_compile.compile(str(main_path), doraise=True)
-
-print(f"Created: {main_path}")
-print(f"Created: {req_path}")
-print("Python syntax check: OK")
