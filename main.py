@@ -953,6 +953,71 @@ def local_answer(question, rows, gaps):
 # OPENAI GPT-5 MINI
 # ============================================================
 
+def compact_data_for_ai(rows, gaps, max_rows=1200, max_gaps=100):
+    """
+    OpenAI uchun Google Sheets ma'lumotlarini ixchamlashtiradi.
+
+    Muhim: barcha ustunlarni xom holatda yubormaydi. Savol-javob uchun
+    asosiy maydonlar + bo'sh bo'lmagan qo'shimcha ustunlar beriladi.
+    Bu token sarfini va 429/limit ehtimolini kamaytiradi.
+    """
+    selected = rows[-max_rows:]
+    data = []
+
+    for r in selected:
+        item = {
+            "row": r.get("row_number"),
+            "id": r.get("id", ""),
+            "agent": r.get("agent", ""),
+            "mijoz": r.get("mijoz", ""),
+            "zona": r.get("zona", ""),
+            "vaqt": r.get("vaqt_raw", ""),
+            "start": r.get("start_raw", ""),
+            "end": r.get("end_raw", ""),
+            "gps_m": round(float(r.get("pogreshnost_m", 0) or 0), 1),
+            "foto": int(r.get("foto_soni", 0) or 0),
+        }
+
+        raw = r.get("raw", {}) or {}
+        skip = {
+            "ид", "id", "пользователь", "клиент", "рабочая зона",
+            "время визита", "дата визита", "дата", "начало визита",
+            "начала визита", "конец визита", "погрешность", "фото"
+        }
+
+        for key, value in raw.items():
+            normalized = normalize_header(key)
+            if normalized in skip:
+                continue
+            if str(value).strip():
+                item[str(key)] = value
+
+        data.append(item)
+
+    long_gaps = []
+    for g in sorted(
+        (x for x in gaps if x.get("is_long")),
+        key=lambda x: x.get("gap_minutes", 0),
+        reverse=True,
+    )[:max_gaps]:
+        prev = g.get("previous", {})
+        curr = g.get("current", {})
+        long_gaps.append({
+            "agent": g.get("agent", ""),
+            "old_shop": prev.get("mijoz", ""),
+            "old_end": prev.get("end_raw", ""),
+            "new_shop": curr.get("mijoz", ""),
+            "new_start": curr.get("start_raw", ""),
+            "lost_minutes": round(float(g.get("gap_minutes", 0) or 0), 1),
+        })
+
+    return {
+        "summary": make_summary(rows, gaps),
+        "rows": data,
+        "long_gaps": long_gaps,
+    }
+
+
 def call_openai(question, rows, gaps):
     """Murakkab savollarni OpenAI GPT-5 mini orqali javoblaydi."""
     if not OPENAI_API_KEY:
