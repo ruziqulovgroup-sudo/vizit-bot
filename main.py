@@ -34,6 +34,7 @@ import time
 import json
 import logging
 import threading
+from functools import lru_cache
 from datetime import datetime
 from collections import defaultdict
 
@@ -64,6 +65,9 @@ MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "60"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
+OPENAI_CACHE_TTL = int(os.getenv("OPENAI_CACHE_TTL", "900"))
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 
 MAX_POGRESHNOST_METERS = float(
     os.getenv("MAX_POGRESHNOST_METERS", "150")
@@ -90,6 +94,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
+
+# OpenAI'ni keraksiz qayta-qayta chaqirishni cheklaydi.
+_OPENAI_LOCK = threading.Lock()
+_OPENAI_CACHE = {}
 
 
 # ============================================================
@@ -1018,92 +1026,122 @@ def compact_data_for_ai(rows, gaps, max_rows=1200, max_gaps=100):
     }
 
 
+def _cached_ai_answer(question):
+    key = re.sub(r"\s+", " ", question.strip().lower())
+    item = _OPENAI_CACHE.get(key)
+    if not item:
+        return None
+    created, answer = item
+    if time.time() - created > OPENAI_CACHE_TTL:
+        _OPENAI_CACHE.pop(key, None)
+        return None
+    return answer
+
+
+def _save_ai_answer(question, answer):
+    key = re.sub(r"\s+", " ", question.strip().lower())
+    _OPENAI_CACHE[key] = (time.time(), answer)
+    # Cache juda kattalashib ketmasin.
+    if len(_OPENAI_CACHE) > 300:
+        oldest = sorted(_OPENAI_CACHE.items(), key=lambda x: x[1][0])[:50]
+        for k, _ in oldest:
+            _OPENAI_CACHE.pop(k, None)
+
+
 def call_openai(question, rows, gaps):
-    """Murakkab savollarni OpenAI GPT-5 mini orqali javoblaydi."""
+    """Murakkab savollarni OpenAI orqali javoblaydi.
+
+    Eslatma: API'ni haqiqiy "limitsiz" qilib bo'lmaydi. Bu funksiya esa
+    keraksiz chaqiruvlarni cache, qisqa prompt, retry va bitta vaqtdagi
+    so'rovni qulflash orqali keskin kamaytiradi.
+    """
     if not OPENAI_API_KEY:
         return (
             "⚠️ <b>OpenAI ulanmagan.</b>\n\n"
-            "Railway Variables'da "
-            "<code>OPENAI_API_KEY</code> variable qo'ying."
+            "Railway Variables'da <code>OPENAI_API_KEY</code> variable qo'ying."
         )
 
-    ai_data = compact_data_for_ai(rows, gaps)
+    cached = _cached_ai_answer(question)
+    if cached:
+        return cached + "\n\n<i>↻ Oldingi javob cache'dan olindi.</i>"
+
+    ai_data = compact_data_for_ai(rows, gaps, max_rows=700, max_gaps=50)
 
     system = f"""
 Sen Vizit nazorat tizimining AI yordamchisisan.
+Javob tili: o'zbek tili. Telegram uchun qisqa, chiroyli va tushunarli javob ber.
 
-Javob tili: o'zbek tili.
-Telegram uchun chiroyli, qisqa va tushunarli javob ber.
-Kerak bo'lsa ruscha agent/mijoz nomlarini o'zgartirma.
-
-MUHIM QOIDALAR:
-1. Faqat berilgan Google Sheets ma'lumotlariga asoslan.
-2. Ma'lumotda yo'q narsani o'ylab topma.
-3. Savol Google Sheets ma'lumotiga tegishli bo'lsa, aniq hisobla.
-4. Agent, mijoz, ID, sana, vaqt, foto va GPS qiymatlarini saqla.
-5. "ID bo'yicha" so'ralsa ID ni ko'rsat.
-6. "Vaqt yo'qotilishi" so'ralsa oldingi vizitning tugash vaqti bilan
-   keyingi vizitning boshlanish vaqtini solishtir.
-7. Katta vaqt yo'qotilishi chegarasi: {MAX_IDLE_GAP_MINUTES} daqiqa.
-8. GPS muammo chegarasi: {MAX_POGRESHNOST_METERS} metr.
-9. Foto 0 bo'lsa fotosiz deb hisobla.
-10. Natijani bo'limlar, emoji va punktlar bilan ber.
-11. Telegramda ulkan JSON yoki xom ma'lumot chiqarmasdan, natijani
-    inson o'qishi uchun tushunarli shaklda ber.
-12. Oxirida 1-2 qatorlik xulosa ber.
-13. Agar savol ma'lumotda mavjud bo'lmagan mavzu haqida bo'lsa,
-    buni ochiq ayt.
+QOIDALAR:
+- Faqat berilgan Google Sheets ma'lumotlariga asoslan.
+- Ma'lumotda yo'q narsani o'ylab topma.
+- ID, agent, mijoz, sana, vaqt, GPS va foto qiymatlarini saqla.
+- Vaqt yo'qotilishi oldingi vizit tugashi va keyingi vizit boshlanishi orasidagi vaqt.
+- Katta vaqt yo'qotilishi: {MAX_IDLE_GAP_MINUTES} daqiqa.
+- GPS chegarasi: {MAX_POGRESHNOST_METERS} metr.
+- Foto 0 bo'lsa fotosiz.
+- JSON yoki xom jadvalni chiqarma.
+- Javob oxirida qisqa xulosa ber.
+- Ma'lumot yetarli bo'lmasa, buni aniq ayt.
 """
 
     prompt = (
-        f"Foydalanuvchi savoli:\n{question}\n\n"
-        f"Google Sheets ma'lumotlari:\n"
-        f"{json.dumps(ai_data, ensure_ascii=False, default=str)}"
+        f"Savol: {question}\n\n"
+        f"Ma'lumot: {json.dumps(ai_data, ensure_ascii=False, default=str, separators=(',', ':'))}"
     )
 
-    try:
+    # Bir vaqtning o'zida bir nechta agent savol yuborsa, API'ni bosib yubormaydi.
+    with _OPENAI_LOCK:
+        cached = _cached_ai_answer(question)
+        if cached:
+            return cached + "\n\n<i>↻ Oldingi javob cache'dan olindi.</i>"
+
         client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)
-        response = client.responses.create(
-            model=OPENAI_MODEL,
-            instructions=system,
-            input=prompt,
-        )
 
-        answer = (response.output_text or "").strip()
-        if answer:
-            return answer
+        for attempt in range(OPENAI_MAX_RETRIES + 1):
+            try:
+                response = client.responses.create(
+                    model=OPENAI_MODEL,
+                    instructions=system,
+                    input=prompt,
+                    max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+                )
 
-        return "⚠️ OpenAI bo'sh javob qaytardi. Savolni qisqaroq yozib ko'ring."
+                answer = (response.output_text or "").strip()
+                if not answer:
+                    return "⚠️ AI bo'sh javob qaytardi. Savolni qisqaroq yozing."
 
-    except Exception as e:
-        status = getattr(e, "status_code", None)
-        log.exception("OpenAI API xatosi")
+                _save_ai_answer(question, answer)
+                return answer
 
-        if status == 429:
-            return (
-                "⏳ <b>OpenAI API limiti vaqtincha to'ldi.</b>\n\n"
-                "Birozdan keyin qayta urinib ko'ring.\n"
-                "Oddiy statistik savollar esa AI'siz ishlaydi."
-            )
+            except Exception as e:
+                status = getattr(e, "status_code", None)
+                log.warning("OpenAI xatosi attempt=%s status=%s: %s", attempt + 1, status, str(e)[:500])
 
-        if status == 401:
-            return (
-                "🔑 <b>OPENAI_API_KEY noto'g'ri.</b>\n\n"
-                "Railway → Variables bo'limidagi API keyni tekshiring."
-            )
+                if status == 429:
+                    if attempt < OPENAI_MAX_RETRIES:
+                        wait = min(20, 2 ** attempt)
+                        time.sleep(wait)
+                        continue
+                    return (
+                        "⏳ <b>OpenAI API limiti yetib bo'ldi.</b>\n\n"
+                        "Bot keraksiz AI chaqiruvlarini cache va retry bilan kamaytiradi, "
+                        "lekin provayder limitini butunlay olib tashlab bo'lmaydi.\n\n"
+                        "📌 Oddiy statistik savollar AI'siz ishlaydi."
+                    )
 
-        if status == 404:
-            return (
-                f"⚠️ <b>OpenAI model topilmadi.</b>\n\n"
-                f"Model: <code>{OPENAI_MODEL}</code>\n"
-                "OPENAI_MODEL qiymatini tekshiring."
-            )
+                if status == 401:
+                    return "🔑 <b>OPENAI_API_KEY noto'g'ri.</b> Railway → Variables'dan tekshiring."
 
-        return (
-            "⚠️ <b>OpenAI API xatosi.</b>\n\n"
-            f"Kod: <code>{status or 'unknown'}</code>\n"
-            f"<i>{str(e)[:500]}</i>"
-        )
+                if status == 404:
+                    return f"⚠️ <b>Model topilmadi:</b> <code>{OPENAI_MODEL}</code>\nOPENAI_MODEL qiymatini tekshiring."
+
+                return (
+                    "⚠️ <b>OpenAI API xatosi.</b>\n\n"
+                    f"Kod: <code>{status or 'unknown'}</code>\n"
+                    f"<i>{str(e)[:500]}</i>"
+                )
+
+    return "⚠️ AI javobini olishning iloji bo'lmadi."
 
 
 # ============================================================
